@@ -259,7 +259,8 @@ def run_auto(
     spec = expand_spec(prompt, dut, width, use_llm)
     spec, spec_issues = review_spec(spec, use_llm)
     # None = LLM decided: width lives in spec, candidates in suggested_candidates
-    width = width or int(spec.get("data_width", 8))    try:
+    width = width or int(spec.get("data_width", 8))
+    try:
         candidates = candidates or int(spec.get("suggested_candidates", 1))
     except (TypeError, ValueError):
         candidates = 1
