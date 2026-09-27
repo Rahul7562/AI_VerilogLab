@@ -1,5 +1,5 @@
 dut: dut
-model: nvidia/nemotron-3-ultra-550b-a55b:free
+model: poolside/laguna-s-2.1:free
 pdk_choice: auto
 supported_pdks:
 - sky130
