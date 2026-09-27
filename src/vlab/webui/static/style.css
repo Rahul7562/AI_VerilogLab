@@ -14,6 +14,19 @@ button:disabled { opacity: .5; }
 #steps li { padding: 6px 10px; border: 1px solid #2a333d; border-radius: 20px; font-size: 13px; color: #9aa7b2; }
 #steps li.on { border-color: #1f6feb; color: #fff; }
 #steps li.done { border-color: #3fb950; color: #3fb950; }
+#steps li small { display: block; font-size: 10px; color: #6e7b87; }
+#runstatus { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-bottom: 8px; }
+#statedot { width: 10px; height: 10px; border-radius: 50%; background: #6e7b87; display: inline-block; }
+#statedot.running { background: #1f6feb; animation: pulse 1.2s infinite; }
+#statedot.done { background: #3fb950; }
+#statedot.error { background: #f85149; }
+#statedot.stalled { background: #d29922; }
+@keyframes pulse { 50% { opacity: .35; } }
+#issues .err { background: #3d1215; border: 1px solid #f85149; border-radius: 6px;
+  padding: 6px 10px; margin: 4px 0; font-size: 12px; }
+#issues .warn { background: #33270e; border: 1px solid #d29922; border-radius: 6px;
+  padding: 6px 10px; margin: 4px 0; font-size: 12px; }
+.dim { color: #6e7b87; font-size: 12px; }
 #log { background: #0b0f13; height: 220px; overflow-y: auto; font-size: 12px; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { border: 1px solid #2a333d; padding: 4px 8px; text-align: left; }

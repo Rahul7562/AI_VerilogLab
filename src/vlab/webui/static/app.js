@@ -1,7 +1,29 @@
 /* Dashboard controller: status, run submit, SSE progress/logs, results. */
 let runId = null, es = null, poll = null, zoom = 1, waveData = null;
+let lastSeen = 0, stepTimes = {}, runOver = false, ticker = null;
+const STALL_S = 240;
 
 const $ = id => document.getElementById(id);
+
+function fmtTime(ts) {
+  return new Date(ts * 1000).toLocaleTimeString();
+}
+
+function setStatus(mode, text) {
+  $("statedot").className = mode;
+  $("statetext").textContent = text;
+}
+
+function tickAgo() {
+  if (!lastSeen) return;
+  const s = Math.floor(Date.now() / 1000 - lastSeen);
+  const stalled = !runOver && s > STALL_S;
+  $("ago").textContent = stalled
+    ? `no updates for ${Math.floor(s / 60)}m — long model calls can take minutes`
+    : `updated ${s}s ago`;
+  if (stalled) setStatus("stalled", "stalled?");
+  else if (!runOver) setStatus("running", "running");
+}
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -26,13 +48,25 @@ function logLine(src, text) {
   el.scrollTop = el.scrollHeight;
 }
 
-function setStep(step, done) {
+function setStep(step, done, at) {
   document.querySelectorAll("#steps li").forEach(li => {
     if (li.dataset.step === step) {
       li.classList.add(done ? "done" : "on");
       if (done) li.classList.remove("on");
+      if (at) {
+        let sm = li.querySelector("small");
+        if (!sm) { sm = document.createElement("small"); li.appendChild(sm); }
+        sm.textContent = fmtTime(at);
+      }
     }
   });
+  const order = ["define", "generate", "verify", "synthesize", "ppa", "select", "done"];
+  const labels = { define: "Define", generate: "Generate", verify: "Verify", synthesize: "Synthesize", ppa: "Measure PPA", select: "Select+Learn", done: "Output" };
+  const idx = order.indexOf(step);
+  const next = done ? order[idx + 1] : step;
+  $("stage").textContent = next && labels[next]
+    ? `stage: ${labels[next]}${done ? "" : " (in progress)"}`
+    : "stage: done";
 }
 
 async function refreshState() {
@@ -44,7 +78,30 @@ async function refreshState() {
       `<tr><td>${c.id.split("__").pop()}</td><td>${c.status || "-"}</td>` +
       `<td>${c.pass_count ?? "-"}</td><td>${c.cells ?? "-"}</td>` +
       `<td>${c.crit_ns ?? "-"}</td><td>${c.power_w ?? "-"}</td></tr>`).join("");
+    renderIssues(s.candidates || []);
+    if (s.meta && s.meta.status === "error") {
+      setStatus("error", "error: " + (s.meta.detail || "").slice(0, 120));
+    }
   } catch (e) { /* run dir appears later */ }
+}
+
+function renderIssues(cands) {
+  const box = $("issues");
+  const rows = [];
+  for (const c of cands) {
+    const id = (c.id || "").split("__").pop();
+    if (c.status === "error" || c.status === "fail") {
+      rows.push(`<div class="err"><b>${id} ${c.status}</b>` +
+        (c.note ? `: ${c.note}` : " — see sim.log") + `</div>`);
+    } else if ((c.fail_count || 0) > 0) {
+      rows.push(`<div class="warn"><b>${id}</b>: ${c.fail_count} failing check(s), ` +
+        `${c.pass_count || 0} passing</div>`);
+    }
+    for (const w of (c.warnings || [])) {
+      rows.push(`<div class="warn"><b>${id}</b>: ${w}</div>`);
+    }
+  }
+  box.innerHTML = rows.length ? rows.join("") : '<span class="dim">none yet</span>';
 }
 
 async function fileExists(p) {
@@ -191,6 +248,12 @@ function showQuestions(ticket, questions) {
 
 function beginRun(run_id) {
   runId = run_id;
+  lastSeen = Date.now() / 1000;
+  stepTimes = {};
+  runOver = false;
+  setStatus("running", "running");
+  if (ticker) clearInterval(ticker);
+  ticker = setInterval(tickAgo, 1000);
   $("progsec").classList.remove("hidden");
   $("resec").classList.add("hidden");
   $("log").textContent = "";
@@ -200,7 +263,9 @@ function beginRun(run_id) {
   es = new EventSource(`/api/runs/${runId}/events`);
   es.onmessage = async ev => {
     const m = JSON.parse(ev.data);
-    if (m.type === "step") setStep(m.step, true);
+    lastSeen = Date.now() / 1000;
+    if (!runOver) setStatus("running", "running");
+    if (m.type === "step") { stepTimes[m.step] = m.at; setStep(m.step, true, m.at); }
     else if (m.type === "log") m.lines.forEach(l => logLine(m.source, l));
     else if (m.type === "done") { await refreshState(); finish(await loadResults()); }
     else if (m.type === "error") { logLine("error", m.message); await loadResults().catch(() => {}); finish(false); }
@@ -211,13 +276,18 @@ function beginRun(run_id) {
 }
 
 function finish(ok) {
+  runOver = true;
+  if (ticker) clearInterval(ticker);
   $("start").disabled = false;
   if (poll) clearInterval(poll);
   if (es) es.close();
   if (ok) {
+    setStatus("done", "finished");
     document.querySelectorAll("#steps li").forEach(li => {
       if (!li.classList.contains("done")) li.classList.add("done");
     });
+  } else {
+    setStatus("error", "finished with failures");
   }
 }
 

@@ -22,7 +22,8 @@ from .tools import check_tools
 
 STEPS = ["define", "generate", "verify", "synthesize", "ppa", "select", "done"]
 
-# run_id -> {"queue": Queue, "done": bool}
+# run_id -> {"queue": Queue, "done": bool, "created": ts, "last_event": ts,
+#              "status": "running"|"done"|"error", "detail": str, "steps": {step: ts}}
 _RUNS: dict[str, dict[str, Any]] = {}
 _RUNS_LOCK = threading.Lock()
 # clarify tickets: ticket -> {"req": AutoRequest, "questions": list}
@@ -60,10 +61,30 @@ def _workspace(project: str | None) -> Path:
     return pdir
 
 
+def _register_run(run_id: str) -> None:
+    now = time.time()
+    with _RUNS_LOCK:
+        _RUNS[run_id] = {
+            "queue": queue.Queue(maxsize=2000), "done": False,
+            "created": now, "last_event": now, "status": "running",
+            "detail": "", "steps": {},
+        }
+
+
 def _emit(run_id: str, event: dict[str, Any]) -> None:
+    event = {"at": time.time(), **event}
     with _RUNS_LOCK:
         run = _RUNS.get(run_id)
-    if run and not run["done"]:
+        if run is None or run["done"]:
+            return
+        run["last_event"] = event["at"]
+        if event["type"] == "step":
+            run["steps"][event["step"]] = event["at"]
+        elif event["type"] == "error":
+            run["status"] = "error"
+            run["detail"] = str(event.get("message", ""))[:300]
+        elif event["type"] == "done":
+            run["status"] = "done"
         try:
             run["queue"].put_nowait(event)
         except queue.Full:
@@ -89,8 +110,26 @@ def _snapshot(run_dir: Path) -> dict[str, Any]:
     if (run_dir / "spec.json").exists():
         state["steps"]["define"] = "done"
     cand_dirs = _sibling_cands(run_dir)
+    notes: dict[str, str] = {}
+    mem = run_dir / "memory.jsonl"
+    if mem.exists():
+        for line in mem.read_text().splitlines()[-50:]:
+            try:
+                e = json.loads(line)
+                if e.get("note"):
+                    notes[e.get("id", "")] = str(e["note"])[:300]
+            except (json.JSONDecodeError, ValueError):
+                continue
     for cdir in cand_dirs:
         c: dict[str, Any] = {"id": cdir.name}
+        gen_p = cdir / "gen.json"
+        if gen_p.exists():
+            try:
+                c["warnings"] = json.loads(gen_p.read_text()).get("warnings", [])
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if cdir.name in notes:
+            c["note"] = notes[cdir.name]
         if (cdir / "design.v").exists():
             state["steps"]["generate"] = "done"
             c["rtl"] = True
@@ -260,8 +299,7 @@ def create_app(project: str | None = None) -> FastAPI:
         import uuid
 
         run_id = uuid.uuid4().hex[:12]
-        with _RUNS_LOCK:
-            _RUNS[run_id] = {"queue": queue.Queue(maxsize=2000), "done": False}
+        _register_run(run_id)
         stop = threading.Event()
         # monitor starts immediately; worker fills artifacts as it goes
         threading.Thread(
@@ -276,9 +314,20 @@ def create_app(project: str | None = None) -> FastAPI:
     def run_state(run_id: str):
         run_dir = _find_run_dir(pdir, run_id)
         if run_dir is None:
-            raise HTTPException(404, "unknown run")
+            # run may not have produced a session dir yet
+            with _RUNS_LOCK:
+                run = _RUNS.get(run_id)
+            if run is None:
+                raise HTTPException(404, "unknown run")
+            return {
+                "run_id": run_id, "pending": True,
+                "meta": _run_meta(run_id, run),
+            }
         snap = _snapshot(run_dir)
         snap["run_id"] = run_id
+        with _RUNS_LOCK:
+            run = _RUNS.get(run_id)
+        snap["meta"] = _run_meta(run_id, run)
         return snap
 
     @app.get("/api/runs/{run_id}/events")
@@ -293,11 +342,13 @@ def create_app(project: str | None = None) -> FastAPI:
             yield ": connected\n\n"
             while True:
                 try:
-                    ev = q.get(timeout=25)
+                    ev = q.get(timeout=15)
                 except queue.Empty:
-                    yield ": ping\n\n"
                     with _RUNS_LOCK:
-                        done = _RUNS.get(run_id, {}).get("done", True)
+                        r = _RUNS.get(run_id, {})
+                        done = r.get("done", True)
+                    # heartbeat: keeps client clock + stall detector alive
+                    yield f"data: {json.dumps({'type': 'ping', 'at': time.time()})}\n\n"
                     if done and q.empty():
                         break
                     continue
@@ -335,6 +386,22 @@ def create_app(project: str | None = None) -> FastAPI:
         return FileResponse(target, media_type=media)
 
     return app
+
+
+def _run_meta(run_id: str, run: dict[str, Any] | None) -> dict[str, Any]:
+    if run is None:
+        return {"status": "unknown", "detail": "", "current_step": None, "steps": {}}
+    steps = run.get("steps", {})
+    current = next((s for s in STEPS if s not in steps), "done")
+    return {
+        "status": run.get("status", "running"),
+        "detail": run.get("detail", ""),
+        "created": run.get("created"),
+        "last_event": run.get("last_event"),
+        "now": time.time(),
+        "current_step": current,
+        "steps": steps,
+    }
 
 
 def _find_run_dir(pdir: Path, run_id: str) -> Path | None:

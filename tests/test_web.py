@@ -52,3 +52,26 @@ def test_clarify_ticket_flow(tmp_path, monkeypatch):
     assert r2.json()["run_id"]
     assert c.post("/api/runs/answer",
                   json={"ticket": "deadbeef", "answers": []}).status_code == 404
+
+
+def test_state_reports_issues_and_meta(tmp_path):
+    import json as _json
+
+    c = TestClient(create_app(str(tmp_path)))
+    root = tmp_path / "runs" / "r2"
+    cand = tmp_path / "runs" / "r2__i1c1"
+    root.mkdir(parents=True)
+    cand.mkdir(parents=True)
+    (root / "spec.json").write_text("{}")
+    (cand / "spec.json").write_text("{}")
+    (cand / "sim.json").write_text(_json.dumps(
+        {"status": "fail", "pass_count": 2, "fail_count": 1}))
+    (cand / "gen.json").write_text(_json.dumps({"warnings": ["no VCD"]}))
+    (tmp_path / "runs" / "r2" / "memory.jsonl").write_text(
+        _json.dumps({"id": "r2__i1c1", "note": "boom"}) + "\n")
+    st = c.get("/api/runs/r2").json()
+    assert st["meta"]["status"] in ("running", "unknown")
+    assert st["meta"]["current_step"] in ("define", None)
+    (c0,) = st["candidates"]
+    assert c0["status"] == "fail" and c0["note"] == "boom"
+    assert c0["warnings"] == ["no VCD"]
