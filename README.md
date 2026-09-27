@@ -15,7 +15,7 @@ cp .env.example .env   # set OPENROUTER_API_KEY (never commit .env)
 uv run vlab check-llm
 ```
 
-Default model: `nvidia/nemotron-3-ultra-550b-a55b:free`
+Default model: `poolside/laguna-s-2.1:free`
 (`OPENROUTER_MODEL` overrides).
 
 ## EDA tools

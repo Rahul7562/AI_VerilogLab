@@ -1,0 +1,14 @@
+dut: dut
+model: nvidia/nemotron-3-ultra-550b-a55b:free
+pdk_choice: auto
+supported_pdks:
+- sky130
+- nangate45
+- asap7
+flow:
+  simulator: iverilog
+  synth: yosys+abc
+  ppa:
+    area: yosys
+    timing: opensta
+    power: opensta+vcd
