@@ -109,3 +109,72 @@ def test_extract_tb_fence_and_raw():
     assert "tb_bar" in _extract_tb(raw, "bar")
     with pytest.raises(ValueError):
         _extract_tb("no verilog here", "baz")
+
+
+def test_require_sane():
+    from vlab.rtl_gen import _require_sane
+
+    good_d = "module foo(input a); endmodule"
+    good_t = "module tb_foo; $dumpfile(\"w\"); $finish; endmodule"
+    _require_sane(good_d, good_t, "foo")  # must not raise
+    with pytest.raises(ValueError, match="wrong module"):
+        _require_sane("module bar; endmodule", good_t, "foo")
+    with pytest.raises(ValueError, match="wrong module"):
+        _require_sane(good_d, "module tb_x; $finish; endmodule", "foo")
+    with pytest.raises(ValueError, match="\\$finish"):
+        _require_sane(good_d, "module tb_foo; endmodule", "foo")
+
+
+def test_gen_retry_then_success(tmp_path, monkeypatch):
+    import json as _json
+
+    import vlab.llm as llm_mod
+    from vlab.rtl_gen import run_gen
+
+    spec = {
+        "dut_name": "foo", "description": "d", "category": "sequential",
+        "data_width": 1, "pdk_choice": "auto", "ports": [
+            {"name": "a", "direction": "input", "width": 1},
+            {"name": "y", "direction": "output", "width": 1}],
+    }
+    proj = tmp_path / "p"
+    (proj / "sessions" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1" / "spec.json").write_text(_json.dumps(spec))
+    good = _json.dumps({
+        "design": "module foo(input a, output y); assign y = a; endmodule",
+        "testbench": "module tb_foo; $dumpfile(\"w\"); $finish; endmodule"})
+    calls = {"n": 0}
+
+    def fake_chat(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return '{"design": "module foo(truncated'
+        return good
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    m = run_gen(proj, "s1", proj / "runs" / "s1" / "spec.json", use_llm=True)
+    assert calls["n"] == 2
+    assert (proj / "runs" / "s1" / "gen_raw_retry.txt").exists()
+    assert "module foo" in open(proj / "runs" / "s1" / "design.v").read()
+
+
+def test_gen_double_failure_raises(tmp_path, monkeypatch):
+    import json as _json
+
+    import vlab.llm as llm_mod
+    from vlab.rtl_gen import run_gen
+
+    spec = {
+        "dut_name": "foo", "description": "d", "category": "sequential",
+        "data_width": 1, "pdk_choice": "auto", "ports": [
+            {"name": "a", "direction": "input", "width": 1},
+            {"name": "y", "direction": "output", "width": 1}],
+    }
+    proj = tmp_path / "p"
+    (proj / "sessions" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1" / "spec.json").write_text(_json.dumps(spec))
+    monkeypatch.setattr(llm_mod, "chat", lambda *a, **k: "thinking prose, no code")
+    with pytest.raises(ValueError):
+        run_gen(proj, "s1", proj / "runs" / "s1" / "spec.json", use_llm=True)

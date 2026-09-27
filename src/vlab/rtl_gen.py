@@ -55,6 +55,16 @@ def parse_llm_output(text: str, dut: str) -> tuple[str, str, str]:
         # single block containing both — split on testbench module
         idx = blocks[0].find(f"module tb_{dut}")
         return blocks[0][:idx].strip(), blocks[0][idx:].strip(), ""
+    # raw Verilog without any fences
+    if f"module {dut}" in t and f"module tb_{dut}" in t:
+        idx = t.find(f"module tb_{dut}")
+        design, tb = t[:idx].strip(), t[idx:].strip()
+        # strip any leading prose before the design module
+        dstart = design.find(f"module {dut}")
+        if dstart > 0:
+            design = design[dstart:].strip()
+        if "endmodule" in design and "endmodule" in tb:
+            return design, tb, ""
     raise ValueError("Could not parse LLM output into design + testbench")
 
 
@@ -155,18 +165,26 @@ def builtin_template(spec: dict[str, Any]) -> tuple[str, str]:
     return design, tb
 
 
-def _validate(design: str, tb: str, dut: str) -> list[str]:
-    warns: list[str] = []
+def _require_sane(design: str, tb: str, dut: str) -> None:
+    """Hard reject unusable output (wrong module, TB that can't terminate)."""
+    problems = []
     if f"module {dut}" not in design:
-        warns.append(f"design missing 'module {dut}'")
-    if "endmodule" not in design:
-        warns.append("design missing endmodule")
-    if f"tb_{dut}" not in tb:
-        warns.append(f"testbench missing tb_{dut}")
+        problems.append(f"design names wrong module (want {dut})")
+    if f"module tb_{dut}" not in tb:
+        problems.append(f"testbench names wrong module (want tb_{dut})")
+    if "$finish" not in tb:
+        problems.append("testbench missing $finish (would hang the simulator)")
+    if problems:
+        raise ValueError("unusable LLM output: " + "; ".join(problems))
+
+
+def _validate(design: str, tb: str, dut: str) -> list[str]:
+    """Soft warnings only (hard failures are rejected by _require_sane)."""
+    warns: list[str] = []
+    if "endmodule" not in design or "endmodule" not in tb:
+        warns.append("design/testbench missing endmodule")
     if "$dumpfile" not in tb or "$dumpvars" not in tb:
         warns.append("testbench missing $dumpfile/$dumpvars (wave.vcd won't generate)")
-    if "$finish" not in tb:
-        warns.append("testbench missing $finish")
     return warns
 
 
@@ -211,9 +229,33 @@ def run_gen(
             max_tokens=max_tokens,
             temperature=0.2,
         )
-        design, tb, notes = parse_llm_output(raw, dut)
-        llm_used = True
         (outdir / "gen_raw.txt").write_text(raw)
+        try:
+            design, tb, notes = parse_llm_output(raw, dut)
+            _require_sane(design, tb, dut)
+        except ValueError:
+            # retry with the FULL prompt (truncated/placeholder first replies
+            # are common on loaded free-tier models; a bare nudge invites
+            # generic examples, so resend the task with a strict trailer)
+            raw2 = llm_chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "You output only JSON with design + testbench Verilog.",
+                    },
+                    {"role": "user", "content": prompt + (
+                        "\nIMPORTANT: your previous reply was truncated or invalid. "
+                        "Output ONLY one complete JSON object "
+                        "{\"design\": \"...\", \"testbench\": \"...\", "
+                        "\"notes\": \"...\"}, no prose, no fences.")},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
+            (outdir / "gen_raw_retry.txt").write_text(raw2)
+            design, tb, notes = parse_llm_output(raw2, dut)
+            _require_sane(design, tb, dut)
+        llm_used = True
     else:
         design, tb = builtin_template(spec)
         notes = "builtin offline template (no LLM)"
