@@ -1,0 +1,335 @@
+/* Minimal generic liberty for VerilogLab demo (NOT a real PDK).
+   Provides basic cells so yosys abc mapping + OpenSTA timing/power can run
+   end-to-end. Replace with sky130/nangate45/asap7 lib for real numbers. */
+library (generic_demo) {
+  technology (cmos);
+  delay_model : table_lookup;
+  time_unit : "1ns";
+  voltage_unit : "1V";
+  current_unit : "1mA";
+  capacitive_load_unit (1, pf);
+  pulling_resistance_unit : "1kohm";
+  default_inout_pin_cap : 0.01;
+  default_input_pin_cap : 0.01;
+  default_output_pin_cap : 0.0;
+  default_max_transition : 1.0;
+  nom_process : 1.0;
+  nom_temperature : 25.0;
+  nom_voltage : 1.0;
+  operating_conditions (typical) {
+    process : 1.0;
+    temperature : 25.0;
+    voltage : 1.0;
+  }
+  default_operating_conditions : typical;
+
+  input_threshold_pct_rise : 50.0;
+  input_threshold_pct_fall : 50.0;
+  output_threshold_pct_rise : 50.0;
+  output_threshold_pct_fall : 50.0;
+  slew_lower_threshold_pct_rise : 20.0;
+  slew_upper_threshold_pct_rise : 80.0;
+  slew_lower_threshold_pct_fall : 20.0;
+  slew_upper_threshold_pct_fall : 80.0;
+  slew_derate_from_library : 1.0;
+
+  lu_table_template (delay_template_2x2) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.05, 0.5");
+    index_2 ("0.01, 0.1");
+  }
+  lu_table_template (constraint_template_2x2) {
+    variable_1 : related_pin_transition;
+    variable_2 : constrained_pin_transition;
+    index_1 ("0.05, 0.5");
+    index_2 ("0.05, 0.5");
+  }
+  power_lut_template (power_template_2x2) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.05, 0.5");
+    index_2 ("0.01, 0.1");
+  }
+  power_lut_template (power_template_1d) {
+    variable_1 : input_net_transition;
+    index_1 ("0.05, 0.5");
+  }
+
+  cell (INVX1) {
+    area : 1.0;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "!A";
+      timing () {
+        related_pin : "A";
+        timing_sense : negative_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (BUFX1) {
+    area : 1.0;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (AND2X1) {
+    area : 1.5;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (B) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "A B";
+      timing () {
+        related_pin : "A B";
+        timing_sense : positive_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.07, 0.10", "0.11, 0.15");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.07, 0.10", "0.11, 0.15");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (OR2X1) {
+    area : 1.5;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (B) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "A + B";
+      timing () {
+        related_pin : "A B";
+        timing_sense : positive_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.07, 0.10", "0.11, 0.15");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.07, 0.10", "0.11, 0.15");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (NAND2X1) {
+    area : 1.2;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (B) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "!(A B)";
+      timing () {
+        related_pin : "A B";
+        timing_sense : negative_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.06, 0.09", "0.10, 0.13");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.06, 0.09", "0.10, 0.13");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (NOR2X1) {
+    area : 1.2;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (B) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "!(A + B)";
+      timing () {
+        related_pin : "A B";
+        timing_sense : negative_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.06, 0.09", "0.10, 0.13");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.06, 0.09", "0.10, 0.13");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (XOR2X1) {
+    area : 2.0;
+    cell_leakage_power : 1.0e-6;
+    pin (A) { direction : input; capacitance : 0.01; }
+    pin (B) { direction : input; capacitance : 0.01; }
+    pin (Y) {
+      direction : output;
+      function : "A ^ B";
+      timing () {
+        related_pin : "A B";
+        timing_sense : non_unate;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.09, 0.13", "0.14, 0.18");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.09, 0.13", "0.14, 0.18");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+  }
+
+  cell (DFFX1) {
+    area : 4.0;
+    cell_leakage_power : 1.0e-6;
+    ff ("IQ", "IQN") { clocked_on : "CK"; next_state : "D"; clear : "RN'"; preset : "SN'"; }
+    pin (D) {
+      direction : input;
+      capacitance : 0.01;
+      timing () {
+        related_pin : "CK";
+        timing_type : setup_rising;
+        rise_constraint (constraint_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.06", "0.07, 0.08");
+        }
+        fall_constraint (constraint_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.06", "0.07, 0.08");
+        }
+      }
+      timing () {
+        related_pin : "CK";
+        timing_type : hold_rising;
+        rise_constraint (constraint_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.02, 0.03", "0.03, 0.04");
+        }
+        fall_constraint (constraint_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.02, 0.03", "0.03, 0.04");
+        }
+      }
+    }
+    pin (CK) { direction : input; capacitance : 0.02; clock : true; }
+    pin (RN) { direction : input; capacitance : 0.01; }
+    pin (SN) { direction : input; capacitance : 0.01; }
+    pin (Q) {
+      direction : output;
+      function : "IQ";
+      timing () {
+        related_pin : "CK";
+        timing_type : rising_edge;
+        cell_rise (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.10, 0.14", "0.15, 0.20");
+        }
+        cell_fall (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.10, 0.14", "0.15, 0.20");
+        }
+        rise_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+        fall_transition (delay_template_2x2) {
+          index_1 ("0.05, 0.5"); index_2 ("0.01, 0.1");
+          values ("0.05, 0.08", "0.09, 0.12");
+        }
+      }
+    }
+    pin (QN) { direction : output; function : "IQN"; }
+  }
+}
