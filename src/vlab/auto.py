@@ -15,7 +15,7 @@ from .optimize import (
     memory_append,
     memory_read,
     pareto_frontier,
-    rank_candidates,
+    pick_winner,
     search_guidance,
 )
 from .spec import heuristic_pdk, llm_pick_pdk, validate_spec
@@ -278,8 +278,7 @@ def run_auto(
         if it < iterations:
             guidance = search_guidance(spec, memory_read(mem), front, all_cands)
 
-    order = rank_candidates(all_cands)
-    winner = all_cands[order[0]] if order else None
+    winner = pick_winner(all_cands)
     final_dir = None
     if winner and winner["status"] == "pass":
         final_dir = rdir / "final"
@@ -333,6 +332,7 @@ def _write_comparison(rdir: Path, cands: list[dict[str, Any]], summary: dict[str
             f"{c.get('power_w', '-')} | {c.get('fmax_mhz', '-')} | "
             f"{(c.get('constraints') or {}).get('feasible', '-')} |"
         )
-    lines += ["", f"Winner: `{summary['winner']}`",
+    lines += ["", f"Winner: `{summary['winner']}`" if summary["winner"]
+              else "Winner: none — all candidates failed (see sim.log in each run dir)",
               f"Pareto: {[cands[i]['id'].split('__')[-1] for i in summary['pareto']]}"]
     (rdir / "COMPARISON.md").write_text("\n".join(lines) + "\n")

@@ -6,6 +6,7 @@ from vlab.optimize import (
     memory_append,
     memory_read,
     pareto_frontier,
+    pick_winner,
     rank_candidates,
 )
 
@@ -37,6 +38,13 @@ def test_rank_prefers_feasible_then_power():
     cands = [_c(power=5e-4, feasible=True), _c(power=1e-4, feasible=False),
              {"status": "fail", "power_w": 1e-9, "crit_ns": 0.1, "cells": 1}]
     assert rank_candidates(cands)[0] == 0
+
+
+def test_pick_winner_never_failed():
+    assert pick_winner([{"status": "fail"}, {"status": "error"}]) is None
+    assert pick_winner([]) is None
+    cands = [_c(power=5e-4, feasible=True), _c(power=1e-4, feasible=False)]
+    assert pick_winner(cands) is cands[0]
 
 
 def test_check_constraints():

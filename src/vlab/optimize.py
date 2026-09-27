@@ -79,6 +79,14 @@ def pareto_frontier(cands: list[dict[str, Any]]) -> list[int]:
     return front
 
 
+def pick_winner(cands: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Best passing candidate by rank order, else None (never a failed one)."""
+    for i in rank_candidates(cands):
+        if cands[i].get("status") == "pass":
+            return cands[i]
+    return None
+
+
 def rank_candidates(cands: list[dict[str, Any]]) -> list[int]:
     """Best-first order: feasible > passing; then power, crit, cells (None last)."""
 

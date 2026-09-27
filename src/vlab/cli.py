@@ -267,10 +267,14 @@ def auto_cmd(
     console.print(f"[green]Session:[/green] {s['session']}  "
                   f"winner={s['winner']} final={s['final']}")
     for c in s["candidates"]:
+        note = f" note={c['note']}" if c.get("note") else ""
         console.print(f"  {c['id'].split('__')[-1]}: {c['status']} "
                       f"cells={c.get('cells')} crit={c.get('crit_ns')} "
-                      f"power={c.get('power_w')}")
+                      f"power={c.get('power_w')}{note}")
     if not s["final"]:
+        console.print("[red]No passing candidate — see sim.log in each "
+                      "candidate run dir. Re-run with more --candidates, "
+                      "more --fix-rounds, or a tighter prompt.[/red]")
         raise typer.Exit(code=1)
 
 

@@ -27,6 +27,7 @@ def chat(
     max_tokens: int = 2048,
     temperature: float = 0.2,
     timeout: int = 90,
+    retries: int = 1,
 ) -> str:
     """Single chat completion via OpenRouter. Raises on failure."""
     key = get_api_key()
@@ -41,14 +42,29 @@ def chat(
         api_key=key,
         timeout=timeout,
     )
-    resp = client.chat.completions.create(
-        model=get_model(),
-        messages=messages,  # type: ignore[arg-type]
-        max_tokens=max_tokens,
-        temperature=temperature,
-        extra_headers=_headers(),
-    )
-    return (resp.choices[0].message.content or "").strip()
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=get_model(),
+                messages=messages,  # type: ignore[arg-type]
+                max_tokens=max_tokens,
+                temperature=temperature,
+                extra_headers=_headers(),
+            )
+            choices = resp.choices or []
+            text = (choices[0].message.content if choices else None) or ""
+            if not text.strip():
+                raise RuntimeError(
+                    f"empty model reply (finish={getattr(choices[0] if choices else None, 'finish_reason', '?')})"
+                )
+            return text.strip()
+        except Exception as e:  # noqa: BLE001 - retry transient, surface rest
+            last_err = e
+            msg = str(e)
+            if "401" in msg or "auth" in msg.lower() or "api key" in msg.lower():
+                break
+    raise RuntimeError(f"LLM call failed after {retries + 1} attempt(s): {last_err}"[:500])
 
 
 def check_llm(max_tokens: int = 16) -> tuple[bool, str]:

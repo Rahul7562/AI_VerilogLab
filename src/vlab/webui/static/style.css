@@ -21,6 +21,8 @@ th, td { border: 1px solid #2a333d; padding: 4px 8px; text-align: left; }
 .metric { background: #0b0f13; border: 1px solid #2a333d; border-radius: 6px; padding: 8px 12px; }
 .metric b { display: block; font-size: 18px; }
 .metric span { font-size: 11px; color: #9aa7b2; }
+.fail { background: #3d1215; border: 1px solid #f85149; color: #ffb4b4;
+  border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; font-size: 13px; }
 .tabs button { background: #222c36; margin-right: 4px; }
 .tabs button.on { background: #1f6feb; }
 .tab { margin-top: 10px; }

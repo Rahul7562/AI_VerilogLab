@@ -70,6 +70,17 @@ async function loadResults() {
   $("resec").classList.remove("hidden");
   const st = await (await api(`/api/runs/${runId}`)).json();
   const base = st.winner ? "" : "";
+  const fail = $("failnote");
+  if (!st.winner) {
+    const det = (st.candidates || []).map(c =>
+      `${c.id.split("__").pop()}: ${c.status || "?"}`).join(", ");
+    fail.textContent =
+      `No passing candidate (${det}). Check the log above and per-candidate ` +
+      `sim.log files, then re-run with more candidates, more fix rounds, or a tighter prompt.`;
+    fail.classList.remove("hidden");
+  } else {
+    fail.classList.add("hidden");
+  }
   // metric cards from winner candidate dir = final/
   let ppa = {};
   try { ppa = JSON.parse(await fileText("final/ppa.json")); } catch (e) {}
@@ -119,6 +130,7 @@ async function loadResults() {
       }
     }
   }
+  return !!st.winner;
 }
 
 function drawWave() {
@@ -190,21 +202,23 @@ function beginRun(run_id) {
     const m = JSON.parse(ev.data);
     if (m.type === "step") setStep(m.step, true);
     else if (m.type === "log") m.lines.forEach(l => logLine(m.source, l));
-    else if (m.type === "done") { await refreshState(); await loadResults(); finish(); }
-    else if (m.type === "error") { logLine("error", m.message); await loadResults().catch(() => {}); finish(); }
+    else if (m.type === "done") { await refreshState(); finish(await loadResults()); }
+    else if (m.type === "error") { logLine("error", m.message); await loadResults().catch(() => {}); finish(false); }
   };
   es.onerror = () => { /* server closes at end; keep polling once more */ };
   poll = setInterval(refreshState, 2000);
   refreshState();
 }
 
-function finish() {
+function finish(ok) {
   $("start").disabled = false;
   if (poll) clearInterval(poll);
   if (es) es.close();
-  document.querySelectorAll("#steps li").forEach(li => {
-    if (!li.classList.contains("done")) li.classList.add("done");
-  });
+  if (ok) {
+    document.querySelectorAll("#steps li").forEach(li => {
+      if (!li.classList.contains("done")) li.classList.add("done");
+    });
+  }
 }
 
 document.querySelectorAll(".tabs button").forEach(b => {
