@@ -85,3 +85,75 @@ def test_auto_survives_candidate_error(tmp_path, monkeypatch):
     assert by_cand[2]["status"] == "error"
     assert s["winner"] is not None  # c1 still carried the run
     assert (tmp_path / "runs" / s["session"] / "auto.json").exists()
+
+
+def _mk_fix_session(tmp_path, dut="dut1"):
+    import json as _json
+
+    proj = tmp_path / "p"
+    (proj / "runs" / "s1").mkdir(parents=True)
+    spec = {
+        "dut_name": dut, "description": "d", "category": "sequential",
+        "data_width": 1, "pdk_choice": "auto",
+        "ports": [{"name": "a", "direction": "input", "width": 1},
+                  {"name": "y", "direction": "output", "width": 1}],
+    }
+    (proj / "runs" / "s1" / "spec.json").write_text(_json.dumps(spec))
+    (proj / "runs" / "s1" / "design.v").write_text(
+        f"module {dut}(input a, output y); assign y = a; endmodule")
+    (proj / "runs" / "s1" / f"tb_{dut}.v").write_text(
+        f"module tb_{dut}; $finish; endmodule")
+    return proj
+
+
+def test_is_compile_fail():
+    from vlab.fix import is_compile_fail
+
+    assert is_compile_fail({"rc": 30}, "syntax error somewhere")
+    assert is_compile_fail({"rc": 1}, "some log")
+    assert not is_compile_fail({"rc": 0}, "PASS: x\nFAIL: y")
+    assert not is_compile_fail({"rc": 0}, "PASS: x")
+
+
+def test_extract_design_and_intact():
+    from vlab.fix import _extract_design, _require_design_intact
+
+    raw = ("prose\n```verilog\nmodule dut1(input a, output y);\n"
+           "assign y = a;\nendmodule\n```")
+    d = _extract_design(raw, "dut1")
+    assert "module dut1" in d
+    _require_design_intact(d, "dut1", [{"name": "a"}, {"name": "y"}])
+    with pytest.raises(ValueError, match="dropped ports"):
+        _require_design_intact(d, "dut1", [{"name": "a"}, {"name": "zzz"}])
+    with pytest.raises(ValueError):
+        _extract_design("no code here", "dut1")
+
+
+def test_fix_repairs_design_on_compile_error(tmp_path, monkeypatch):
+    import vlab.fix as fix_mod
+    import vlab.llm as llm_mod
+    import vlab.sim as sim_mod
+
+    proj = _mk_fix_session(tmp_path)
+    states = [{"status": "fail", "pass_count": 0, "fail_count": 0, "rc": 30},
+              {"status": "pass", "pass_count": 1, "fail_count": 0, "rc": 0}]
+
+    def fake_sim(*a, **k):
+        (proj / "runs" / "s1" / "sim.log").write_text("design.v:1: syntax error")
+        return states.pop(0)
+
+    fixed = ("```verilog\nmodule dut1(input a, output y);\n"
+             "assign y = a;\nendmodule\n```")
+    seen_prompts = []
+    monkeypatch.setattr(sim_mod, "run_simulate", fake_sim)
+
+    def fake_chat(messages, **kw):
+        seen_prompts.append(messages[0]["content"])
+        return fixed
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    out = fix_mod.run_fix(proj, "s1", rounds=2)
+    assert out["final"] == "pass"
+    assert "COMPILE" in seen_prompts[0]
+    assert (proj / "runs" / "s1" / "design.v").read_text() == (
+        "module dut1(input a, output y);\nassign y = a;\nendmodule")

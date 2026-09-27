@@ -180,17 +180,25 @@ def _verify_candidate(
     max_fix_rounds: int,
     golden: dict[str, Any],
 ) -> dict[str, Any]:
-    """Simulate + LLM-repair working TB (never the frozen golden)."""
-    from .fix import _extract_tb, repair_prompt
+    """Simulate + LLM-repair (DUT on compile errors, else working TB)."""
+    from .fix import (
+        _extract_design,
+        _extract_tb,
+        _require_design_intact,
+        design_repair_prompt,
+        is_compile_fail,
+        repair_prompt,
+    )
     from .llm import chat as llm_chat
     from .sim import run_simulate
 
     outdir = session_dir(project_dir, cid)
-    dut = json.loads((outdir / "spec.json").read_text())["dut_name"]
-    design = (outdir / "design.v").read_text()
+    spec = json.loads((outdir / "spec.json").read_text())
+    dut = spec["dut_name"]
     repairs = 0
     # freeze golden on first PASS (tb + pass count as anti-weakening bar)
     for _ in range(max_fix_rounds + 1):
+        design = (outdir / "design.v").read_text()
         sim = run_simulate(project_dir, cid, tool="auto")
         status, passes, fails = sim["status"], sim["pass_count"], sim["fail_count"]
         if status == "pass":
@@ -210,9 +218,15 @@ def _verify_candidate(
         tb = next(iter(sorted(outdir.glob("tb_*.v")))).read_text()
         simlog = outdir / "sim.log"
         log = simlog.read_text() if simlog.exists() else "(no sim log)"
+        design_target = is_compile_fail(sim, log)
+        prompt = (
+            design_repair_prompt(design, log, dut, spec.get("ports", []))
+            if design_target
+            else repair_prompt(design, tb, log, dut)
+        )
         try:
             raw = llm_chat(
-                [{"role": "user", "content": repair_prompt(design, tb, log, dut)}],
+                [{"role": "user", "content": prompt}],
                 max_tokens=6000,
                 temperature=0.2,
             )
@@ -223,11 +237,16 @@ def _verify_candidate(
             }
         (outdir / f"fix_r{repairs + 1}_raw.txt").write_text(raw)
         try:
-            fixed = _extract_tb(raw, dut)
-        except ValueError:
+            if design_target:
+                fixed = _extract_design(raw, dut)
+                _require_design_intact(fixed, dut, spec.get("ports", []))
+                (outdir / "design.v").write_text(fixed)
+            else:
+                fixed = _extract_tb(raw, dut)
+                (outdir / f"tb_{dut}.v").write_text(fixed)
+        except ValueError as e:
             repairs += 1  # truncated/garbled output: count round, retry
             continue
-        (outdir / f"tb_{dut}.v").write_text(fixed)
         repairs += 1
     return {"status": "fail", "passes": 0, "fails": 0, "repairs": repairs}
 
