@@ -135,14 +135,26 @@ def _verify_candidate(
         if repairs >= max_fix_rounds:
             return {"status": "fail", "passes": passes, "fails": fails, "repairs": repairs}
         tb = next(iter(sorted(outdir.glob("tb_*.v")))).read_text()
-        log = (outdir / "sim.log").read_text()
-        raw = llm_chat(
-            [{"role": "user", "content": repair_prompt(design, tb, log, dut)}],
-            max_tokens=3000,
-            temperature=0.2,
-        )
+        simlog = outdir / "sim.log"
+        log = simlog.read_text() if simlog.exists() else "(no sim log)"
+        try:
+            raw = llm_chat(
+                [{"role": "user", "content": repair_prompt(design, tb, log, dut)}],
+                max_tokens=6000,
+                temperature=0.2,
+            )
+        except Exception as e:  # noqa: BLE001 - LLM outage ends repairs
+            return {
+                "status": "fail", "passes": passes, "fails": fails,
+                "repairs": repairs, "note": f"llm call failed: {e}"[:200],
+            }
         (outdir / f"fix_r{repairs + 1}_raw.txt").write_text(raw)
-        (outdir / f"tb_{dut}.v").write_text(_extract_tb(raw, dut))
+        try:
+            fixed = _extract_tb(raw, dut)
+        except ValueError:
+            repairs += 1  # truncated/garbled output: count round, retry
+            continue
+        (outdir / f"tb_{dut}.v").write_text(fixed)
         repairs += 1
     return {"status": "fail", "passes": 0, "fails": 0, "repairs": repairs}
 
@@ -187,19 +199,23 @@ def run_auto(
     for it in range(1, iterations + 1):
         for c in range(1, candidates + 1):
             cid = f"{sid}__i{it}c{c}"
-            cdir = session_dir(project_dir, cid)
-            shutil.copy(rdir / "spec.json", cdir / "spec.json")
-            if use_llm:
-                run_gen(project_dir, cid, cdir / "spec.json", use_llm=True, guidance=guidance)
-            else:
-                run_gen(project_dir, cid, cdir / "spec.json", use_llm=False)
-            ver = _verify_candidate(project_dir, cid, max_fix_rounds, golden) if use_llm else _offline_verify(project_dir, cid)
-            entry: dict[str, Any] = {
-                "id": cid, "iter": it, "cand": c,
-                "status": ver["status"], "passes": ver.get("passes", 0),
-                "repairs": ver.get("repairs", 0), "note": ver.get("note", ""),
-            }
-            if ver["status"] == "pass":
+            entry: dict[str, Any] = {"id": cid, "iter": it, "cand": c}
+            try:
+                cdir = session_dir(project_dir, cid)
+                shutil.copy(rdir / "spec.json", cdir / "spec.json")
+                if use_llm:
+                    run_gen(project_dir, cid, cdir / "spec.json", use_llm=True, guidance=guidance)
+                else:
+                    run_gen(project_dir, cid, cdir / "spec.json", use_llm=False)
+                ver = _verify_candidate(project_dir, cid, max_fix_rounds, golden) if use_llm else _offline_verify(project_dir, cid)
+                entry.update({
+                    "status": ver["status"], "passes": ver.get("passes", 0),
+                    "repairs": ver.get("repairs", 0), "note": ver.get("note", ""),
+                })
+            except Exception as e:  # noqa: BLE001 - one bad candidate must not kill the run
+                entry.update({"status": "error", "passes": 0, "repairs": 0,
+                              "note": f"{type(e).__name__}: {e}"[:200]})
+            if entry.get("status") == "pass":
                 try:
                     syn = run_synth(project_dir, cid)
                     ppa = run_ppa(project_dir, cid, freq_mhz=freq_mhz)
@@ -222,9 +238,9 @@ def run_auto(
         final_dir = rdir / "final"
         final_dir.mkdir(exist_ok=True)
         wdir = session_dir(project_dir, winner["id"])
-        artifacts = ["spec.json", "design.v", "sim.json", "sim.log", "wave.vcd",
-                     "synth.json", "synth.log", "netlist.v", "netlist.json",
-                     "area.json", "ppa.json"]
+        artifacts = ["spec.json", "design.v", "gen.json", "sim.json", "sim.log",
+                     "wave.vcd", "synth.json", "synth.log", "netlist.v",
+                     "netlist.json", "area.json", "ppa.json"]
         for f in artifacts:
             src = wdir / f
             if src.exists():

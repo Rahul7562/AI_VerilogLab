@@ -74,14 +74,22 @@ def run_fix(
         if sim["status"] == "pass":
             break
         log = (outdir / "sim.log").read_text()
-        raw = llm_chat(
-            [{"role": "user", "content": repair_prompt(design, tb, log, dut)}],
-            max_tokens=3000,
-            temperature=0.2,
-            timeout=timeout,
-        )
+        try:
+            raw = llm_chat(
+                [{"role": "user", "content": repair_prompt(design, tb, log, dut)}],
+                max_tokens=6000,
+                temperature=0.2,
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001 - record and stop
+            entry["note"] = f"llm call failed: {e}"[:200]
+            break
         (outdir / f"fix_r{rnd}_raw.txt").write_text(raw)
-        fixed = _extract_tb(raw, dut)
+        try:
+            fixed = _extract_tb(raw, dut)
+        except ValueError:
+            entry["note"] = "unparseable LLM output (truncated?)"
+            continue
         tb_path = outdir / f"tb_{dut}.v"
         tb_path.write_text(fixed)
         entry["repaired_bytes"] = len(fixed)

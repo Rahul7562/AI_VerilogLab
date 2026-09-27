@@ -241,7 +241,7 @@ def auto_cmd(
             iterations=iterations, max_fix_rounds=fix_rounds,
             use_llm=use_llm, freq_mhz=freq_mhz,
         )
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=1)
     console.print(f"[green]Session:[/green] {s['session']}  "

@@ -54,13 +54,14 @@ def _vcd_toggle_estimate(vcd: Path, freq_mhz: float = 100.0) -> dict[str, Any]:
     toggles = 0
     signals = set()
     try:
-        for line in vcd.read_text(errors="ignore").splitlines()[:200000]:
-            if line.startswith("$var"):
-                signals.add(line)
-            elif line and line[0] in "01xXzZ":
-                toggles += 1
-            elif line.startswith("#"):
-                pass
+        with open(vcd, errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i > 200000:
+                    break
+                if line.startswith("$var"):
+                    signals.add(line)
+                elif line and line[0] in "01xXzZ" and len(line) > 1:
+                    toggles += 1
     except FileNotFoundError:
         return {"method": "none", "power_w": None}
     # P ~ toggles * C * V^2 * f normalized — placeholder scaling, clearly labeled estimate
