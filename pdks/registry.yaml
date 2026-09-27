@@ -1,0 +1,17 @@
+# PDK registry — AI auto-selects unless user overrides in Q&A.
+# M1 Q&A offers: auto (recommended) | sky130 | nangate45 | asap7
+pdks:
+  - name: sky130
+    desc: "130nm open PDK, good for teaching / area-tolerant designs"
+    best_for: ["learning", "low-cost", "area-tolerant"]
+  - name: nangate45
+    desc: "45nm open cell library, balanced speed/area"
+    best_for: ["balanced", "mid-speed"]
+  - name: asap7
+    desc: "7nm predictive PDK, best for high-speed / small area"
+    best_for: ["high-speed", "area-optimized", "timing-critical"]
+
+auto_select_hints:
+  high_speed: asap7
+  balanced: nangate45
+  learning: sky130

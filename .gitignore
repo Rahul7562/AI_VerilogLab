@@ -1,0 +1,17 @@
+# runs/ outputs (vcd, netlists, logs, reports) — keep dir via .gitkeep
+runs/*
+!runs/.gitkeep
+sessions/*
+!sessions/.gitkeep
+# env with secrets - never commit real keys
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.vcd
+*.vvp
