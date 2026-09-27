@@ -254,6 +254,21 @@ def auto_cmd(
         raise typer.Exit(code=1)
 
 
+@app.command("serve")
+def serve_cmd(
+    project: str = typer.Option(None, "--project", help="Workspace dir."),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+):
+    """Start the localhost dashboard (prompt -> live progress -> results)."""
+    import uvicorn
+
+    from .web import create_app
+
+    console.print(f"[green]Serving AI VerilogLab on http://{host}:{port}[/green]")
+    uvicorn.run(create_app(project), host=host, port=port, log_level="warning")
+
+
 @app.command("fix")
 def fix_cmd(
     session: str = typer.Option(None, "--session"),

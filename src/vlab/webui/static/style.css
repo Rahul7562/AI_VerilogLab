@@ -1,0 +1,31 @@
+body { font-family: system-ui, sans-serif; margin: 0; background: #0f1419; color: #e6e6e6; }
+header { padding: 12px 20px; background: #161d24; border-bottom: 1px solid #2a333d; }
+header h1 { margin: 0; font-size: 20px; }
+#statusline { font-size: 12px; color: #9aa7b2; }
+main { max-width: 1100px; margin: 16px auto; padding: 0 12px 40px; }
+.card { background: #161d24; border: 1px solid #2a333d; border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+.hidden { display: none; }
+textarea { width: 100%; box-sizing: border-box; background: #0b0f13; color: #e6e6e6; border: 1px solid #2a333d; border-radius: 6px; padding: 8px; }
+.row { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+input { background: #0b0f13; color: #e6e6e6; border: 1px solid #2a333d; border-radius: 4px; padding: 4px 6px; width: 90px; }
+button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+button:disabled { opacity: .5; }
+#steps { display: flex; list-style: none; padding: 0; gap: 6px; flex-wrap: wrap; }
+#steps li { padding: 6px 10px; border: 1px solid #2a333d; border-radius: 20px; font-size: 13px; color: #9aa7b2; }
+#steps li.on { border-color: #1f6feb; color: #fff; }
+#steps li.done { border-color: #3fb950; color: #3fb950; }
+#log { background: #0b0f13; height: 220px; overflow-y: auto; font-size: 12px; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border: 1px solid #2a333d; padding: 4px 8px; text-align: left; }
+#cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.metric { background: #0b0f13; border: 1px solid #2a333d; border-radius: 6px; padding: 8px 12px; }
+.metric b { display: block; font-size: 18px; }
+.metric span { font-size: 11px; color: #9aa7b2; }
+.tabs button { background: #222c36; margin-right: 4px; }
+.tabs button.on { background: #1f6feb; }
+.tab { margin-top: 10px; }
+#wave { width: 100%; background: #0b0f13; border: 1px solid #2a333d; border-radius: 6px; }
+pre.code { background: #0b0f13; padding: 8px; border-radius: 6px; overflow: auto; max-height: 400px; font-size: 12px; }
+#schem { overflow: auto; background: #0b0f13; border-radius: 6px; }
+#ppa h1, #ppa h2, #ppa h3 { margin: 8px 0 4px; }
+#ppa code { background: #222c36; padding: 1px 4px; border-radius: 3px; }

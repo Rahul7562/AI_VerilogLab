@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI VerilogLab</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>AI VerilogLab</h1>
+  <div id="statusline"><span id="ver"></span> · <span id="tools"></span> · <span id="llm"></span></div>
+</header>
+
+<main>
+<section id="promptsec" class="card">
+  <h2>1 · Describe the DUT</h2>
+  <textarea id="prompt" rows="3" placeholder="e.g. 8-bit up/down counter with enable and synchronous active-low reset"></textarea>
+  <div class="row">
+    <label>DUT <input id="dut" placeholder="auto"></label>
+    <label>Width <input id="width" type="number" value="8" min="1" max="1024"></label>
+    <label>Candidates <input id="candidates" type="number" value="1" min="1" max="8"></label>
+    <label>Iterations <input id="iterations" type="number" value="1" min="1" max="5"></label>
+    <label class="chk"><input id="usellm" type="checkbox" checked> use LLM</label>
+    <button id="start">Run</button>
+  </div>
+  <div id="runid"></div>
+</section>
+
+<section id="progsec" class="card hidden">
+  <h2>2 · Progress</h2>
+  <ol id="steps">
+    <li data-step="define">Define</li>
+    <li data-step="generate">Generate</li>
+    <li data-step="verify">Verify</li>
+    <li data-step="synthesize">Synthesize</li>
+    <li data-step="ppa">Measure PPA</li>
+    <li data-step="select">Select+Learn</li>
+    <li data-step="done">Output</li>
+  </ol>
+  <h3>Live log</h3>
+  <pre id="log"></pre>
+  <h3>Candidates</h3>
+  <table id="candtab"><thead><tr>
+    <th>id</th><th>status</th><th>pass</th><th>cells</th><th>crit ns</th><th>power W</th>
+  </tr></thead><tbody></tbody></table>
+</section>
+
+<section id="resec" class="card hidden">
+  <h2>3 · Results <span id="winner"></span></h2>
+  <div id="cards"></div>
+  <div class="tabs">
+    <button data-tab="t-wave" class="on">Waveform</button>
+    <button data-tab="t-sch">Schematic</button>
+    <button data-tab="t-rtl">RTL + Netlist</button>
+    <button data-tab="t-rep">Reports</button>
+    <button data-tab="t-files">Files</button>
+  </div>
+  <div id="t-wave" class="tab">
+    <div class="row"><button id="zin">+</button><button id="zout">−</button><span id="winfo"></span></div>
+    <canvas id="wave" height="320"></canvas>
+  </div>
+  <div id="t-sch" class="tab hidden"><div id="schem"></div></div>
+  <div id="t-rtl" class="tab hidden">
+    <h3>design.v</h3><pre id="design" class="code"></pre>
+    <h3>netlist.v</h3><pre id="netlist" class="code"></pre>
+  </div>
+  <div id="t-rep" class="tab hidden">
+    <h3>PPA.md</h3><div id="ppa"></div>
+    <h3>Comparison</h3><div id="comp"></div>
+  </div>
+  <div id="t-files" class="tab hidden"><ul id="files"></ul></div>
+</section>
+</main>
+
+<script src="/static/wave.js"></script>
+<script src="/static/schematic.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -76,6 +76,20 @@ Correctness guard: the first passing testbench is frozen as
 `golden_tb_<dut>.v`, and repairs that drop below its PASS count are rejected,
 so optimization cannot win by weakening the test.
 
+## Web dashboard (localhost GUI)
+
+```bash
+uv run vlab serve --project ./my_proj --port 8000
+# open http://127.0.0.1:8000
+```
+
+Enter a prompt → 7-step progress bar (Define → Generate → Verify →
+Synthesize → Measure PPA → Select+Learn → Output) with realtime tool logs,
+a live candidate table, then results: metric cards, in-browser waveform
+rendered from `wave.vcd`, auto-laid-out netlist schematic from `netlist.json`,
+RTL/netlist source, `PPA.md` + comparison, and file downloads. API key stays
+server-side in `.env`; the browser never sees it.
+
 Non-interactive (CI/tests):
 
 ```bash
