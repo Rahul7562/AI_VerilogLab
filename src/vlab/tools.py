@@ -27,17 +27,20 @@ TOOL_SPECS: list[tuple[str, str, list[str], str]] = [
 
 
 def check_tools() -> list[ToolStatus]:
-    from .config import resolve_tool as _resolve
+    from .config import resolve_tool as _resolve, tool_env as _tool_env
 
+    env = _tool_env()
     results: list[ToolStatus] = []
     for display, binary, ver_args, purpose in TOOL_SPECS:
         path = _resolve(binary)
         if not path:
             results.append(ToolStatus(display, binary, False, "", purpose))
             continue
-        rc, out = run_capture([binary, *ver_args])
+        rc, out = run_capture([path, *ver_args], extra_env=env)
         hint = ""
         if out.strip():
             hint = out.strip().splitlines()[0][:120]
+        if not hint:
+            hint = path
         results.append(ToolStatus(display, binary, True, hint, purpose))
     return results

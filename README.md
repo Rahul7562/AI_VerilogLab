@@ -18,7 +18,7 @@ uv run vlab check-llm
 Default model: `nvidia/nemotron-3-ultra-550b-a55b:free`
 (`OPENROUTER_MODEL` overrides).
 
-## EDA tools (no sudo needed)
+## EDA tools
 
 Debian/Ubuntu with root:
 
@@ -26,19 +26,21 @@ Debian/Ubuntu with root:
 sudo apt install iverilog verilator yosys yosys-abc opensta
 ```
 
-Without root (user-space extract, auto-detected via `/tmp/edatools`):
+Without root, `vlab` auto-detects a user-space toolchain in
+`~/.local/edatools` (no `PATH`/`LD_LIBRARY_PATH` exports needed).
+To (re)provision it:
 
 ```bash
 mkdir -p /tmp/edatools && cd /tmp/edatools
 apt download iverilog yosys yosys-abc verilator opensta libtcl8.6
 mkdir -p extract && for f in *.deb; do dpkg-deb -x "$f" extract/; done
-export PATH=/tmp/edatools/extract/usr/bin:$PATH
-export LD_LIBRARY_PATH=/tmp/edatools/extract/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-export TCL_LIBRARY=/tmp/edatools/extract/usr/share/tcltk/tcl8.6
+cp -r extract/usr/bin/verilator* extract/usr/bin/sta ~/.local/edatools/usr/bin/
+cp -r extract/usr/share/verilator ~/.local/edatools/usr/share/
 ```
 
-`vlab` also honors `VLAB_IVERILOG_BIN`, `VLAB_VVP_BIN`, `VLAB_VERILATOR_BIN`,
-`VLAB_YOSYS_BIN`, `VLAB_STA_BIN`, `VLAB_IVERILOG_BASE` overrides.
+`VLAB_EDA_ROOT` overrides the toolchain root. Finer overrides:
+`VLAB_IVERILOG_BIN`, `VLAB_VVP_BIN`, `VLAB_VERILATOR_BIN`,
+`VLAB_YOSYS_BIN`, `VLAB_STA_BIN`, `VLAB_ABC_BIN`, `VLAB_IVERILOG_BASE`.
 Bundled OpenSTA is 2.0.x: no `read_vcd`, so power uses VCD-derived switching
 activity via `set_power_activity` + `report_power` (method `opensta+vcd-activity`).
 

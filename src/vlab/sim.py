@@ -45,10 +45,10 @@ def _iverilog_base_args(iv: str) -> list[str]:
     explicit = os.getenv("VLAB_IVERILOG_BASE", "").strip()
     if explicit:
         return ["-B", explicit]
-    # known extract locations containing ivl/ivl
+    # known bundled locations containing ivl/ivl
     candidates = [
+        Path.home() / ".local" / "edatools" / "usr" / "lib" / "x86_64-linux-gnu" / "ivl",
         Path("/tmp/edatools/extract/usr/lib/x86_64-linux-gnu/ivl"),
-        Path.home() / ".local" / "eda" / "lib" / "ivl",
         Path("/usr/lib/x86_64-linux-gnu/ivl"),
     ]
     iv_path = Path(iv)
@@ -58,7 +58,7 @@ def _iverilog_base_args(iv: str) -> list[str]:
         if (cand / "ivl").exists():
             return ["-B", str(cand)]
     for c in candidates:
-        if (c / "ivl").exists() and "extract" in str(c):
+        if (c / "ivl").exists():
             return ["-B", str(c)]
     return []
 

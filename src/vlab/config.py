@@ -99,7 +99,9 @@ def find_spec(project_dir: Path, session_id: str | None) -> tuple[str, Path]:
     return latest.name, latest / "spec.json"
 
 
-# --- tool resolution (PATH + VLAB_* overrides + user-space edatools) ---
+# --- tool resolution (PATH + VLAB_* overrides + bundled user-space EDA) ---
+# Persistent toolchain lives in ~/.local/edatools (usr/bin, usr/lib, ...).
+# VLAB_EDA_ROOT overrides; /tmp/edatools/extract kept as legacy fallback.
 
 _TOOL_ENV = {
     "iverilog": "VLAB_IVERILOG_BIN",
@@ -111,10 +113,18 @@ _TOOL_ENV = {
     "sta": "VLAB_STA_BIN",
 }
 
-_EXTRA_BIN_DIRS = (
-    Path.home() / ".local" / "eda" / "bin",
-    Path("/tmp/edatools/extract/usr/bin"),
-)
+
+def eda_roots() -> list[Path]:
+    roots: list[Path] = []
+    override = os.getenv("VLAB_EDA_ROOT", "").strip()
+    if override:
+        roots.append(Path(override))
+    roots += [Path.home() / ".local" / "edatools", Path("/tmp/edatools/extract")]
+    return [r for r in roots if (r / "usr" / "bin").is_dir()]
+
+
+def _extra_bin_dirs() -> list[Path]:
+    return [r / "usr" / "bin" for r in eda_roots()]
 
 
 def resolve_tool(binary: str) -> str | None:
@@ -126,7 +136,7 @@ def resolve_tool(binary: str) -> str | None:
     found = shutil.which(binary)
     if found:
         return found
-    for d in _EXTRA_BIN_DIRS:
+    for d in _extra_bin_dirs():
         cand = d / binary
         if cand.exists():
             return str(cand)
@@ -134,17 +144,19 @@ def resolve_tool(binary: str) -> str | None:
 
 
 def tool_env() -> dict[str, str]:
-    """Env additions so extracted user-space EDA tools work (tcl, ld path)."""
+    """Env additions so bundled user-space EDA tools work (tcl, ld path)."""
     env: dict[str, str] = {}
-    ld = "/tmp/edatools/extract/usr/lib/x86_64-linux-gnu"
-    tcl = "/tmp/edatools/extract/usr/share/tcltk/tcl8.6"
-    if Path(ld).exists():
-        prev = os.environ.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = f"{ld}:{prev}" if prev else ld
-    if Path(tcl, "init.tcl").exists() and "TCL_LIBRARY" not in os.environ:
-        env["TCL_LIBRARY"] = tcl
-    # yosys share dir for cell libs
-    share = "/tmp/edatools/extract/usr/share/yosys"
-    if Path(share).exists() and "YOSYS_SHARE" not in os.environ:
-        env["YOSYS_SHARE"] = share
+    for root in eda_roots():
+        ld = root / "usr" / "lib" / "x86_64-linux-gnu"
+        tcl = root / "usr" / "share" / "tcltk" / "tcl8.6" / "init.tcl"
+        share = root / "usr" / "share" / "yosys"
+        if ld.is_dir():
+            prev = env.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
+            env["LD_LIBRARY_PATH"] = f"{ld}:{prev}" if prev else str(ld)
+        if tcl.exists() and "TCL_LIBRARY" not in os.environ and "TCL_LIBRARY" not in env:
+            env["TCL_LIBRARY"] = str(tcl.parent)
+        if share.is_dir() and "YOSYS_SHARE" not in os.environ:
+            env["YOSYS_SHARE"] = str(share)
+        if "LD_LIBRARY_PATH" in env and "TCL_LIBRARY" in env:
+            break
     return env

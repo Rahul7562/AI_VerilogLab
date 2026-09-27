@@ -11,11 +11,18 @@ def which(tool: str) -> str | None:
     return shutil.which(tool)
 
 
-def run_capture(cmd: list[str], timeout: int = 15) -> tuple[int, str]:
+def run_capture(
+    cmd: list[str], timeout: int = 15, extra_env: dict[str, str] | None = None
+) -> tuple[int, str]:
     """Run cmd, return (returncode, combined output truncated)."""
+    import os
+
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
     try:
         p = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True, timeout=timeout, env=env
         )
         out = (p.stdout or "") + (p.stderr or "")
         return p.returncode, out[:2000]
