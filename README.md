@@ -1,57 +1,93 @@
 # AI VerilogLab (Phase 1: CLI + backend)
 
-AI-driven Verilog flow: autonomous DUT Q&A -> `design.v` + testbench ->
-simulate (`iverilog`/`verilator`, `wave.vcd`) -> synth (`yosys`+`abc`,
-netlist) -> PPA (`yosys` area, `openSTA` timing + power from VCD).
+AI-driven Verilog flow: autonomous DUT Q&A -> `design.v` + testbench (Nemotron
+via OpenRouter) -> simulate (`iverilog`/`verilator`, `wave.vcd`) ->
+synth (`yosys`+`abc`, netlist) -> PPA (`yosys` area, `openSTA` timing +
+VCD-derived power) -> `PPA.md`.
 
-## M0 — repo + CLI skeleton (this milestone)
+## Setup
 
 ```bash
 uv sync
 uv run vlab --help
 uv run vlab check-tools
-uv run vlab check-llm   # needs OPENROUTER_API_KEY in env or .env
-uv run vlab init --path ./my_proj
-```
-
-`vlab init` creates `vlab_project.yaml`, `sessions/`, `runs/` in the target dir.
-
-## EDA tools (required for M3-M5, only checked in M0)
-
-* `iverilog` + `vvp` (simulation, VCD)
-* `verilator` (alt simulator)
-* `yosys` + `abc` (synthesis, area via `stat`)
-* `sta` (OpenSTA timing + power from VCD)
-* `gtkwave` (optional waveform viewer)
-
-Ubuntu example:
-```bash
-sudo apt install iverilog verilator yosys abc opensta gtkwave
-```
-
-## LLM (OpenRouter)
-
-```bash
-cp .env.example .env
-# edit .env, set OPENROUTER_API_KEY (never commit .env)
-export OPENROUTER_API_KEY=sk-or-v1-...
+cp .env.example .env   # set OPENROUTER_API_KEY (never commit .env)
 uv run vlab check-llm
 ```
 
-Default model: `nvidia/nemotron-3-ultra-550b-a55b:free`.
+Default model: `nvidia/nemotron-3-ultra-550b-a55b:free`
+(`OPENROUTER_MODEL` overrides).
+
+## EDA tools (no sudo needed)
+
+Debian/Ubuntu with root:
+
+```bash
+sudo apt install iverilog verilator yosys yosys-abc opensta
+```
+
+Without root (user-space extract, auto-detected via `/tmp/edatools`):
+
+```bash
+mkdir -p /tmp/edatools && cd /tmp/edatools
+apt download iverilog yosys yosys-abc verilator opensta libtcl8.6
+mkdir -p extract && for f in *.deb; do dpkg-deb -x "$f" extract/; done
+export PATH=/tmp/edatools/extract/usr/bin:$PATH
+export LD_LIBRARY_PATH=/tmp/edatools/extract/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+export TCL_LIBRARY=/tmp/edatools/extract/usr/share/tcltk/tcl8.6
+```
+
+`vlab` also honors `VLAB_IVERILOG_BIN`, `VLAB_VVP_BIN`, `VLAB_VERILATOR_BIN`,
+`VLAB_YOSYS_BIN`, `VLAB_STA_BIN`, `VLAB_IVERILOG_BASE` overrides.
+Bundled OpenSTA is 2.0.x: no `read_vcd`, so power uses VCD-derived switching
+activity via `set_power_activity` + `report_power` (method `opensta+vcd-activity`).
+
+## Flow
+
+```bash
+uv run vlab init --path ./my_proj --dut cnt8
+uv run vlab new --project ./my_proj            # interactive Q&A, PDK auto-select
+uv run vlab gen --project ./my_proj            # LLM design.v + tb
+uv run vlab simulate --project ./my_proj       # iverilog -> wave.vcd
+uv run vlab fix --project ./my_proj            # LLM testbench repair loop (on FAIL)
+uv run vlab synth --project ./my_proj          # yosys+abc -> netlist + area
+uv run vlab ppa --project ./my_proj            # openSTA timing/power
+uv run vlab report --project ./my_proj         # PPA.md
+uv run vlab run --project ./my_proj            # full pipeline in one go
+```
+
+Non-interactive (CI/tests):
+
+```bash
+uv run vlab new --project ./my_proj --non-interactive --dut alu8 \
+  --desc "8-bit adder" --pdk auto --no-llm
+uv run vlab gen --project ./my_proj --no-llm   # offline template RTL
+```
 
 ## PDKs
 
-See `pdks/registry.yaml`. Supported: `sky130`, `nangate45`, `asap7`.
-Q&A offers `auto (recommended)` — AI picks the best optimized PDK from the spec
-and records choice + reason in `spec.json`.
+`pdks/registry.yaml`: `sky130`, `nangate45`, `asap7`.
+Q&A offers `auto (recommended)` — Nemotron picks from the spec and records
+choice + reason in `spec.json`. Synthesis/STA use `pdks/generic.lib`
+(demo liberty with basic cells — numbers are relative, not signoff;
+drop a real `<pdk>.lib` into `pdks/` or pass `--lib` for real mapping).
 
-## PPA (locked)
+## PPA method (locked)
 
-* Area: `yosys stat`
-* Timing: `openSTA`
-* Power: `openSTA power` with switching activity from simulation VCD
+* Area: `yosys stat` cell/wire counts (`area.json`).
+* Timing: `openSTA report_checks` with generated SDC
+  (clock + 20% input/output delay margins) -> WNS/TNS/crit (`ppa.json`).
+* Power: `openSTA report_power` with VCD-derived activity
+  (`set_power_activity`), plus VCD toggle fallback.
+* Waveform: `wave.vcd` (GTKWave-compatible). Netlist: `netlist.v` + `netlist.json`.
 
-## Commits
+## Layout
 
-Every milestone is committed. No secrets in git history (`.env` is gitignored).
+```
+src/vlab/{cli,ask,spec,rtl_gen,sim,synth,ppa,report,fix,llm,tools,config,utils}.py
+pdks/{registry.yaml,generic.lib}  tests/  runs/  sessions/
+```
+
+Every run lives in `runs/<dut>_<timestamp>/`:
+`spec.json design.v tb_*.v sim.log wave.vcd synth.ys netlist.v netlist.json
+area.json design.sdc sta.tcl timing.rpt ppa.json PPA.md`.
