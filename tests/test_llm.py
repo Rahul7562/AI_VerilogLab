@@ -121,6 +121,17 @@ def test_chat_boosts_budget_on_length_cutoff(monkeypatch):
     assert seen_max == [100, 200]  # one free retry with doubled budget
 
 
+def test_default_retries_env(monkeypatch):
+    import vlab.llm as llm_mod
+
+    monkeypatch.delenv("VLAB_LLM_RETRIES", raising=False)
+    assert llm_mod._default_retries() == 2
+    monkeypatch.setenv("VLAB_LLM_RETRIES", "0")
+    assert llm_mod._default_retries() == 0
+    monkeypatch.setenv("VLAB_LLM_RETRIES", "bogus")
+    assert llm_mod._default_retries() == 2
+
+
 def test_reasoning_params_default_and_off(monkeypatch):
     import vlab.llm as llm_mod
 

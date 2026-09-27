@@ -24,6 +24,13 @@ def _headers() -> dict[str, str]:
     }
 
 
+def _default_retries() -> int:
+    try:
+        return max(0, int(os.getenv("VLAB_LLM_RETRIES", "2")))
+    except ValueError:
+        return 2
+
+
 def _retry_after_seconds(err: Exception, default: float) -> float:
     """Best-effort Retry-After extraction from provider errors."""
     try:
@@ -65,9 +72,15 @@ def chat(
     max_tokens: int = 2048,
     temperature: float = 0.2,
     timeout: int = 90,
-    retries: int = 1,
+    retries: int | None = None,
 ) -> str:
-    """Single chat completion via OpenRouter. Raises on failure."""
+    """Single chat completion via OpenRouter. Raises on failure.
+
+    retries None = VLAB_LLM_RETRIES (default 2). 429s back off with
+    Retry-After/exponential waits; length cutoffs get one free budget boost.
+    """
+    if retries is None:
+        retries = _default_retries()
     key = get_api_key()
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY is not set (env or .env).")
