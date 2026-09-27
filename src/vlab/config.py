@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()  # loads .env if present, env vars take precedence
 
 DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_MODEL", "poolside/laguna-s-2.1:free"
+    "OPENROUTER_MODEL", "stealth/space-bunny-alpha"
 )
 OPENROUTER_BASE_URL = os.getenv(
     "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"

@@ -67,7 +67,7 @@ def chat(
     raise RuntimeError(f"LLM call failed after {retries + 1} attempt(s): {last_err}"[:500])
 
 
-def check_llm(max_tokens: int = 16) -> tuple[bool, str]:
+def check_llm(max_tokens: int = 64) -> tuple[bool, str]:
     """Minimal live call to validate key + model. Returns (ok, message)."""
     if not get_api_key():
         return False, "OPENROUTER_API_KEY is not set (env or .env)."
