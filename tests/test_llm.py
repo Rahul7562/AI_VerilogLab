@@ -132,6 +132,24 @@ def test_default_retries_env(monkeypatch):
     assert llm_mod._default_retries() == 2
 
 
+def test_throttle_spacing(monkeypatch):
+    import vlab.llm as llm_mod
+
+    monkeypatch.delenv("VLAB_LLM_MIN_INTERVAL", raising=False)
+    assert llm_mod._min_interval() == 3.0
+    sleeps = []
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
+    now = [1000.0]
+    monkeypatch.setattr(llm_mod.time, "monotonic", lambda: now[0])
+    llm_mod._last_call_ts = 999.0  # 1s ago -> must wait ~2s
+    llm_mod._throttle()
+    assert sleeps and abs(sleeps[0] - 2.0) < 0.01
+    now[0] = 1000.0
+    llm_mod._last_call_ts = 990.0  # 10s ago -> no wait
+    llm_mod._throttle()
+    assert len(sleeps) == 1
+
+
 def test_reasoning_params_default_and_off(monkeypatch):
     import vlab.llm as llm_mod
 

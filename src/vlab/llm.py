@@ -2,10 +2,37 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any
 
 from . import config
+
+# client-side throttle: minimum seconds between LLM calls so bursts of
+# gen/repair calls never trip provider rate limits (default 3s).
+_throttle_lock = threading.Lock()
+_last_call_ts = 0.0
+
+
+def _min_interval() -> float:
+    try:
+        return max(0.0, float(os.getenv("VLAB_LLM_MIN_INTERVAL", "3.0")))
+    except ValueError:
+        return 3.0
+
+
+def _throttle() -> None:
+    global _last_call_ts
+    gap = _min_interval()
+    if gap <= 0:
+        return
+    with _throttle_lock:
+        now = time.monotonic()
+        wait = gap - (now - _last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _last_call_ts = now
 
 
 def get_api_key() -> str:
@@ -84,6 +111,7 @@ def chat(
     key = get_api_key()
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY is not set (env or .env).")
+    _throttle()
     from openai import OpenAI
 
     client = OpenAI(
