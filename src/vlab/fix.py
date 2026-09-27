@@ -28,7 +28,8 @@ def _extract_tb(text: str, dut: str) -> str:
 
 def repair_prompt(design: str, tb: str, log: str, dut: str) -> str:
     return (
-        f"Output ONLY a Verilog testbench in one verilog code fence, no prose.\n"
+        f"Output ONLY a Verilog testbench in one verilog code fence, no prose, "
+        f"no analysis — the code fence must be the first thing in your reply.\n"
         f"Fix this failing iverilog testbench for DUT {dut} (keep module tb_{dut}, "
         f"`timescale 1ns/1ps, $dumpfile(\"wave.vcd\"), $dumpvars(0,tb_{dut}), $finish).\n"
         f"Rules: drive stimulus ONLY at negedge clk; sample outputs with #1 after "

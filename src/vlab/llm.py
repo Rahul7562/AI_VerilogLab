@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from . import config
 
@@ -20,6 +21,26 @@ def _headers() -> dict[str, str]:
         "HTTP-Referer": os.getenv("OPENROUTER_APP_URL", "http://localhost"),
         "X-Title": os.getenv("OPENROUTER_APP_NAME", "AI-VerilogLab"),
     }
+
+
+def _reasoning_params() -> dict[str, Any] | None:
+    """Reasoning controls for thinking models (env-overridable).
+
+    Free-tier reasoning models can burn the whole output budget on thinking
+    traces and never emit the answer. VLAB_REASONING_EFFORT=low (default)
+    caps that; VLAB_REASONING_EFFORT=off disables the parameter entirely.
+    """
+    effort = os.getenv("VLAB_REASONING_EFFORT", "low").strip().lower()
+    if effort in ("off", "none", "disabled"):
+        return None
+    params: dict[str, Any] = {}
+    if effort:
+        params["effort"] = effort
+    try:
+        params["max_tokens"] = int(os.getenv("VLAB_REASONING_MAX_TOKENS", "512"))
+    except ValueError:
+        pass
+    return {"reasoning": params} if params else None
 
 
 def chat(
@@ -43,7 +64,12 @@ def chat(
         timeout=timeout,
     )
     last_err: Exception | None = None
-    for attempt in range(retries + 1):
+    extra: dict[str, Any] = {}
+    reasoning = _reasoning_params()
+    if reasoning:
+        extra["extra_body"] = reasoning
+    attempts_left = retries + 1
+    while attempts_left > 0:
         try:
             resp = client.chat.completions.create(
                 model=get_model(),
@@ -51,6 +77,7 @@ def chat(
                 max_tokens=max_tokens,
                 temperature=temperature,
                 extra_headers=_headers(),
+                **extra,  # type: ignore[arg-type]
             )
             choices = resp.choices or []
             text = (choices[0].message.content if choices else None) or ""
@@ -62,8 +89,12 @@ def chat(
         except Exception as e:  # noqa: BLE001 - retry transient, surface rest
             last_err = e
             msg = str(e)
+            if extra and "reasoning" in msg.lower() and "400" in msg:
+                extra = {}  # provider rejected the param; free retry, bare
+                continue
             if "401" in msg or "auth" in msg.lower() or "api key" in msg.lower():
                 break
+            attempts_left -= 1
     raise RuntimeError(f"LLM call failed after {retries + 1} attempt(s): {last_err}"[:500])
 
 

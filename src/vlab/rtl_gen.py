@@ -9,6 +9,8 @@ from typing import Any
 GEN_PROMPT = """You are an expert Verilog RTL engineer. Given the DUT spec JSON below,
 output exactly two Verilog files.
 
+Respond with ONLY the JSON object as the very first characters — no preamble,
+no analysis, no thinking, no markdown fences around the JSON.
 Rules:
 - design.v: module name MUST be {dut}. Synthesizable Verilog-2005, no SystemVerilog-only constructs.
 - Ports must match spec (names, directions, widths). Keep clk/rst if present.

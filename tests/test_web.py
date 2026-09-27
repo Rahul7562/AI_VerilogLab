@@ -75,3 +75,26 @@ def test_state_reports_issues_and_meta(tmp_path):
     (c0,) = st["candidates"]
     assert c0["status"] == "fail" and c0["note"] == "boom"
     assert c0["warnings"] == ["no VCD"]
+
+
+def test_registry_survives_restart_and_listing(tmp_path):
+    import json as _json
+
+    from vlab import web as web_mod
+
+    proj = tmp_path / "proj"
+    (proj / "runs" / "sess1").mkdir(parents=True)
+    (proj / "runs" / "sess1" / "spec.json").write_text("{}")
+    (proj / "runs" / "sess1" / "a.v").write_text("x")
+    web_mod._registry_write(proj, "abc123", "sess1")
+    # fresh app instance, empty in-memory _RUNS
+    web_mod._RUNS.clear()
+    c = TestClient(create_app(str(proj)))
+    st = c.get("/api/runs/abc123").json()
+    assert st["run_id"] == "abc123"
+    # lookup by session id directly also works
+    assert c.get("/api/runs/sess1").status_code == 200
+    files = c.get("/api/runs/abc123/files").json()["files"]
+    assert "spec.json" in files and "a.v" in files
+    assert c.get("/api/runs/abc123/files/../x").status_code == 404
+    assert c.get("/api/runs/abc123/files/a.v").status_code == 200

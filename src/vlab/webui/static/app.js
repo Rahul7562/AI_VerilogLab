@@ -75,7 +75,7 @@ async function refreshState() {
     const s = await (await api(`/api/runs/${runId}`)).json();
     const tb = document.querySelector("#candtab tbody");
     tb.innerHTML = (s.candidates || []).map(c =>
-      `<tr><td>${c.id.split("__").pop()}</td><td>${c.status || "-"}</td>` +
+      `<tr><td>${c.id.split("__").pop()}</td><td>${c.status || "pending"}</td>` +
       `<td>${c.pass_count ?? "-"}</td><td>${c.cells ?? "-"}</td>` +
       `<td>${c.crit_ns ?? "-"}</td><td>${c.power_w ?? "-"}</td></tr>`).join("");
     renderIssues(s.candidates || []);
@@ -165,26 +165,24 @@ async function loadResults() {
   try { $("netlist").textContent = (await fileText("final/netlist.v")).slice(0, 20000); } catch (e) {}
   try { $("ppa").innerHTML = mdToHtml(await fileText("final/PPA.md")); } catch (e) {}
   try { $("comp").innerHTML = mdToHtml(await fileText("COMPARISON.md")); } catch (e) {}
-  // files
-  const names = ["final/design.v", "final/tb_cnt8.v", "final/wave.vcd", "final/netlist.v",
-    "final/netlist.json", "final/PPA.md", "COMPARISON.md", "auto.json", "memory.jsonl",
-    "final/sim.log", "final/synth.log", "spec.json"];
+  // files (server listing first: covers any DUT name + per-candidate logs)
   const ul = $("files"); ul.innerHTML = "";
+  const names = new Set();
+  try {
+    const listing = await (await api(`/api/runs/${runId}/files`)).json();
+    for (const f of (listing.files || [])) {
+      if (/\.(v|sv|vcd|json|md|log|rpt|tcl|sdc|ys|txt)$/.test(f)
+          && !f.includes("sim.vvp")) names.add(f);
+    }
+  } catch (e) { /* fall back to known names */ }
+  for (const n of ["final/design.v", "final/wave.vcd", "final/netlist.v",
+      "final/netlist.json", "final/PPA.md", "COMPARISON.md", "auto.json",
+      "memory.jsonl", "spec.json"]) names.add(n);
   for (const n of names) {
     if (await fileExists(n)) {
       const li = document.createElement("li");
       li.innerHTML = `<a href="/api/runs/${runId}/files/${n}" download>${n}</a>`;
       ul.appendChild(li);
-    }
-  }
-  // tb file has dut-dependent name; discover via final listing fallback
-  if (!ul.textContent.includes("final/tb_")) {
-    for (const cand of ["final/tb_alu8.v", "final/tb_mydut.v"]) {
-      if (await fileExists(cand)) {
-        const li = document.createElement("li");
-        li.innerHTML = `<a href="/api/runs/${runId}/files/${cand}" download>${cand}</a>`;
-        ul.appendChild(li);
-      }
     }
   }
   return !!st.winner;
@@ -267,12 +265,35 @@ function beginRun(run_id) {
     if (!runOver) setStatus("running", "running");
     if (m.type === "step") { stepTimes[m.step] = m.at; setStep(m.step, true, m.at); }
     else if (m.type === "log") m.lines.forEach(l => logLine(m.source, l));
-    else if (m.type === "done") { await refreshState(); finish(await loadResults()); }
-    else if (m.type === "error") { logLine("error", m.message); await loadResults().catch(() => {}); finish(false); }
+    else if (m.type === "done") {
+      runOver = true;
+      await refreshState();
+      let ok = false;
+      try { ok = await loadResults(); }
+      catch (e) { showFatal("Could not load results: " + e.message); }
+      finish(ok);
+    }
+    else if (m.type === "error") {
+      runOver = true;
+      logLine("error", m.message);
+      try { await loadResults(); } catch (e) { showFatal(String(e.message || e)); }
+      finish(false);
+    }
   };
-  es.onerror = () => { /* server closes at end; keep polling once more */ };
+  es.onerror = () => {
+    if (runOver) return; // normal close at end of stream
+    showFatal("Lost server connection — retrying automatically. " +
+      "Refresh the page if this persists; completed artifacts stay on disk.");
+  };
   poll = setInterval(refreshState, 2000);
   refreshState();
+}
+
+function showFatal(msg) {
+  $("resec").classList.remove("hidden");
+  const fail = $("failnote");
+  fail.textContent = msg;
+  fail.classList.remove("hidden");
 }
 
 function finish(ok) {

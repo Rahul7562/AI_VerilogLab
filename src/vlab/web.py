@@ -225,6 +225,7 @@ def _run_auto_bg(run_id: str, pdir: Path, req: AutoRequest) -> None:
             freq_mhz=req.freq_mhz,
         )
         run_dir = pdir / "runs" / s["session"]
+        _registry_write(pdir, run_id, s["session"])
     except Exception as e:  # noqa: BLE001 - surface to UI
         _emit(run_id, {"type": "error", "message": f"{type(e).__name__}: {e}"[:500]})
     finally:
@@ -369,13 +370,38 @@ def create_app(project: str | None = None) -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    @app.get("/api/runs/{run_id}/files")
+    def run_files(run_id: str):
+        run_dir = _find_run_dir(pdir, run_id)
+        if run_dir is None:
+            raise HTTPException(404, "unknown run")
+        out: list[str] = []
+        roots = [("", run_dir)] + [
+            (c.name, c) for c in _sibling_cands(run_dir)
+        ]
+        for prefix, root in roots:
+            for p in sorted(root.rglob("*")):
+                if p.is_file() and len(out) < 300:
+                    rel = str(p.relative_to(root))
+                    out.append(f"{prefix}/{rel}" if prefix else rel)
+        return {"files": out}
+
     @app.get("/api/runs/{run_id}/files/{fname:path}")
     def run_file(run_id: str, fname: str):
         run_dir = _find_run_dir(pdir, run_id)
         if run_dir is None:
             raise HTTPException(404, "unknown run")
-        target = (run_dir / fname).resolve()
-        if not str(target).startswith(str(run_dir.resolve())) or not target.is_file():
+        if ".." in fname.split("/"):
+            raise HTTPException(404, "no such file")
+        parts = fname.split("/", 1)
+        if len(parts) == 2 and parts[0] in {c.name for c in _sibling_cands(run_dir)}:
+            base = run_dir.parent / parts[0]
+            target = (base / parts[1]).resolve()
+        else:
+            target = (run_dir / fname).resolve()
+        if not str(target).startswith(str((pdir / "runs").resolve())):
+            raise HTTPException(404, "no such file")
+        if not target.is_file():
             raise HTTPException(404, "no such file")
         media = {
             ".v": "text/plain", ".sv": "text/plain", ".json": "application/json",
@@ -404,6 +430,28 @@ def _run_meta(run_id: str, run: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _registry_path(pdir: Path) -> Path:
+    return pdir / "runs" / ".registry.json"
+
+
+def _registry_read(pdir: Path) -> dict[str, str]:
+    try:
+        return json.loads(_registry_path(pdir).read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _registry_write(pdir: Path, run_id: str, sid: str) -> None:
+    try:
+        reg = _registry_read(pdir)
+        reg[run_id] = sid
+        # also allow lookup by session id directly
+        reg.setdefault(sid, sid)
+        _registry_path(pdir).write_text(json.dumps(reg))
+    except OSError:
+        pass
+
+
 def _find_run_dir(pdir: Path, run_id: str) -> Path | None:
     with _RUNS_LOCK:
         mapped = _RUNS.get(run_id, {}).get("run_dir")
@@ -413,6 +461,11 @@ def _find_run_dir(pdir: Path, run_id: str) -> Path | None:
             return cand
     for base in (pdir / "runs",):
         cand = base / run_id
+        if (cand / "spec.json").exists():
+            return cand
+    sid = _registry_read(pdir).get(run_id)
+    if sid:
+        cand = pdir / "runs" / sid
         if (cand / "spec.json").exists():
             return cand
     return None
@@ -441,4 +494,5 @@ def _monitor_wait_sid(run_id: str, pdir: Path, stop: threading.Event) -> None:
     with _RUNS_LOCK:
         if run_id in _RUNS:
             _RUNS[run_id]["run_dir"] = str(run_dir)
+    _registry_write(pdir, run_id, run_dir.name)
     _monitor(run_id, run_dir, stop)
