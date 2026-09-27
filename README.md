@@ -15,7 +15,7 @@ cp .env.example .env   # set OPENROUTER_API_KEY (never commit .env)
 uv run vlab check-llm
 ```
 
-Default model: `stealth/space-bunny-alpha`
+Default model: `nvidia/nemotron-3-ultra-550b-a55b:free`
 (`OPENROUTER_MODEL` overrides).
 
 ## EDA tools
