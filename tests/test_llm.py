@@ -76,6 +76,8 @@ def test_reasoning_params_default_and_off(monkeypatch):
     assert p == {"reasoning": {"effort": "low", "max_tokens": 512}}
     monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
     assert llm_mod._reasoning_params() is None
+    monkeypatch.setenv("VLAB_REASONING_EFFORT", "exclude")
+    assert llm_mod._reasoning_params() == {"reasoning": {"exclude": True}}
 
 
 def test_chat_passes_reasoning_and_falls_back(monkeypatch):

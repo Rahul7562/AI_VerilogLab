@@ -26,13 +26,16 @@ def _headers() -> dict[str, str]:
 def _reasoning_params() -> dict[str, Any] | None:
     """Reasoning controls for thinking models (env-overridable).
 
-    Free-tier reasoning models can burn the whole output budget on thinking
-    traces and never emit the answer. VLAB_REASONING_EFFORT=low (default)
-    caps that; VLAB_REASONING_EFFORT=off disables the parameter entirely.
+    VLAB_REASONING_EFFORT values:
+      off     - send no reasoning parameter (model default; thinking on)
+      exclude - ask the provider to strip reasoning (closest to no thinking)
+      low|medium|high - cap thinking effort (default: low)
     """
     effort = os.getenv("VLAB_REASONING_EFFORT", "low").strip().lower()
     if effort in ("off", "none", "disabled"):
         return None
+    if effort == "exclude":
+        return {"reasoning": {"exclude": True}}
     params: dict[str, Any] = {}
     if effort:
         params["effort"] = effort
