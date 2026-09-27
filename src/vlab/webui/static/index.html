@@ -18,13 +18,18 @@
   <textarea id="prompt" rows="3" placeholder="e.g. 8-bit up/down counter with enable and synchronous active-low reset"></textarea>
   <div class="row">
     <label>DUT <input id="dut" placeholder="auto"></label>
-    <label>Width <input id="width" type="number" value="8" min="1" max="1024"></label>
-    <label>Candidates <input id="candidates" type="number" value="1" min="1" max="8"></label>
+    <label>Width <input id="width" type="number" placeholder="auto" min="1" max="1024"></label>
+    <label>Candidates <input id="candidates" type="number" placeholder="auto" min="1" max="8"></label>
     <label>Iterations <input id="iterations" type="number" value="1" min="1" max="5"></label>
     <label class="chk"><input id="usellm" type="checkbox" checked> use LLM</label>
     <button id="start">Run</button>
   </div>
   <div id="runid"></div>
+  <div id="clarify" class="hidden">
+    <h3>The AI needs a few details</h3>
+    <div id="qlist"></div>
+    <button id="answer">Submit answers</button>
+  </div>
 </section>
 
 <section id="progsec" class="card hidden">

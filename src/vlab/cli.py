@@ -219,21 +219,41 @@ def auto_cmd(
     prompt: str = typer.Option(None, "--prompt", help="One-line design request."),
     project: str = typer.Option(None, "--project"),
     dut: str = typer.Option(None, "--dut", help="Override module name."),
-    width: int = typer.Option(8, "--width"),
-    candidates: int = typer.Option(1, "--candidates", help="N designs per iteration."),
+    width: int = typer.Option(None, "--width", help="Data width (default: LLM decides)."),
+    candidates: int = typer.Option(None, "--candidates", help="N designs/iter (default: LLM decides)."),
     iterations: int = typer.Option(1, "--iterations", help="Search generations."),
     fix_rounds: int = typer.Option(3, "--fix-rounds", help="TB repair rounds each."),
     use_llm: bool = typer.Option(True, "--use-llm/--no-llm"),
     freq_mhz: float = typer.Option(100.0, "--freq-mhz"),
+    no_clarify: bool = typer.Option(False, "--no-clarify", help="Skip clarification questions."),
 ):
     """Single prompt in -> spec -> candidates -> verify/fix -> synth/ppa -> final."""
-    from .auto import run_auto
+    import sys
+
+    from .auto import assess_prompt, run_auto
 
     if not prompt:
         prompt = typer.prompt("Describe the DUT to build")
     if not prompt.strip():
         console.print("[red]Empty prompt.[/red]")
         raise typer.Exit(code=1)
+    if use_llm and not no_clarify:
+        questions = assess_prompt(prompt.strip(), True)
+        if questions:
+            if sys.stdin.isatty():
+                console.print("[yellow]The LLM needs a few details:[/yellow]")
+                answered = []
+                for q in questions:
+                    try:
+                        a = typer.prompt(f"  {q}", default="")
+                    except (EOFError, KeyboardInterrupt):
+                        a = ""
+                    if a.strip():
+                        answered.append(f"{q} -> {a.strip()}")
+                if answered:
+                    prompt = prompt.strip() + "\nClarifications: " + "; ".join(answered)
+            else:
+                console.print("[yellow]Prompt under-specified; proceeding without clarification (non-interactive).[/yellow]")
     pdir = config.resolve_project_dir(project)
     try:
         s = run_auto(

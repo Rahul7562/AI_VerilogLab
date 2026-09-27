@@ -27,8 +27,11 @@ Output ONLY JSON, no prose, with exactly these keys:
 "data_width": <int>, "clock": "<clk port or ''>", "reset": "<e.g. 'rst_n low' or ''>",
 "ports": [{{"name": "...", "direction": "input|output|inout", "width": <int>}}],
 "features": ["..."], "test_plan": ["..."], "target_freq_mhz": <number>,
-"limits": {{"min_freq_mhz": <number>}}}}
+"limits": {{"min_freq_mhz": <number>}},
+"suggested_candidates": <int 1-4: 1 for trivial blocks, 2-3 when architecture
+trade-offs exist (speed vs area vs power), 4 for complex datapaths>}}
 Rules: ports must include clock/reset when sequential; combinational designs omit them.
+Decide data_width from the request (default 8 when unspecified).
 Request: {prompt}
 Width hint: {width}"""
 
@@ -37,17 +40,50 @@ def _sid(dut: str) -> str:
     return f"{dut}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
+CLARIFY_PROMPT = """You review a one-line RTL design request. If it lacks what an
+RTL engineer needs (function, interface/widths, clock/reset, key behaviors),
+reply with ONLY JSON: {{"complete": false, "questions": ["<at most 4 short, specific questions>"]}}.
+If it is sufficient, reply with ONLY JSON: {{"complete": true, "questions": []}}.
+Request: {prompt}"""
+
+
+def assess_prompt(prompt: str, use_llm: bool) -> list[str]:
+    """Return clarifying questions when the prompt is under-specified."""
+    if not use_llm:
+        return []
+    try:
+        from .llm import chat as llm_chat, get_api_key
+
+        if not get_api_key():
+            return []
+        raw = llm_chat(
+            [{"role": "user", "content": CLARIFY_PROMPT.format(prompt=prompt)}],
+            max_tokens=300,
+            temperature=0.2,
+        )
+        obj = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+        if obj.get("complete", True):
+            return []
+        return [str(q) for q in obj.get("questions", []) if str(q).strip()][:4]
+    except Exception:
+        return []
+
+
 def expand_spec(
-    prompt: str, dut_hint: str | None, width: int, use_llm: bool
+    prompt: str, dut_hint: str | None, width: int | None, use_llm: bool
 ) -> dict[str, Any]:
-    """Build a validated spec from a one-line prompt (LLM or template)."""
+    """Build a validated spec from a one-line prompt (LLM or template).
+
+    width None = let the LLM decide (offline: default 8).
+    """
     if use_llm:
         from .llm import chat as llm_chat, get_api_key
 
         if not get_api_key():
             raise RuntimeError("OPENROUTER_API_KEY not set. Use --no-llm.")
         raw = llm_chat(
-            [{"role": "user", "content": SPEC_EXPAND_PROMPT.format(prompt=prompt, width=width)}],
+            [{"role": "user", "content": SPEC_EXPAND_PROMPT.format(
+                prompt=prompt, width=width if width else "auto")}],
             max_tokens=1200,
             temperature=0.2,
         )
@@ -61,29 +97,32 @@ def expand_spec(
             from .spec import validate_module_name
 
             spec["dut_name"] = validate_module_name(dut_hint)
-        spec.setdefault("data_width", width)
+        spec["data_width"] = width or spec.get("data_width", 8)
+        spec.setdefault("suggested_candidates", 1)
         spec["pdk_choice"] = "auto"
         feats = ", ".join(spec.get("features", []))
         selected, reason = llm_pick_pdk(spec["description"], feats, "auto")
     else:
         from .spec import default_spec
 
+        w = width or 8
         spec = default_spec(dut_hint or "my_dut")
         spec.update(
             {
                 "description": prompt,
-                "data_width": width,
+                "data_width": w,
                 "ports": [
                     {"name": "clk", "direction": "input", "width": 1},
                     {"name": "rst_n", "direction": "input", "width": 1},
-                    {"name": "a", "direction": "input", "width": width},
-                    {"name": "b", "direction": "input", "width": width},
-                    {"name": "y", "direction": "output", "width": width},
+                    {"name": "a", "direction": "input", "width": w},
+                    {"name": "b", "direction": "input", "width": w},
+                    {"name": "y", "direction": "output", "width": w},
                 ],
                 "features": ["datapath", "reset"],
                 "test_plan": ["directed basics", "reset check"],
                 "target_freq_mhz": 100,
                 "limits": {"min_freq_mhz": 100},
+                "suggested_candidates": 1,
             }
         )
         selected, reason = heuristic_pdk(prompt, "")
@@ -163,20 +202,20 @@ def run_auto(
     project_dir: Path,
     prompt: str,
     dut: str | None = None,
-    width: int = 8,
-    candidates: int = 1,
+    width: int | None = None,
+    candidates: int | None = None,
     iterations: int = 1,
     max_fix_rounds: int = 3,
     use_llm: bool = True,
     freq_mhz: float = 100.0,
 ) -> dict[str, Any]:
-    """Full autonomous loop. Returns summary dict."""
+    """Full autonomous loop. width/candidates None = decided by the LLM."""
     from .ppa import run_ppa
     from .report import build_report
     from .rtl_gen import run_gen
     from .synth import run_synth
 
-    if candidates < 1:
+    if candidates is not None and candidates < 1:
         raise ValueError("candidates must be >= 1")
     if iterations < 1:
         raise ValueError("iterations must be >= 1")
@@ -184,6 +223,14 @@ def run_auto(
         raise ValueError("max_fix_rounds must be >= 0")
 
     spec = expand_spec(prompt, dut, width, use_llm)
+    # None = LLM decided: width lives in spec, candidates in suggested_candidates
+    width = width or int(spec.get("data_width", 8))
+    try:
+        candidates = candidates or int(spec.get("suggested_candidates", 1))
+    except (TypeError, ValueError):
+        candidates = 1
+    candidates = max(1, min(8, candidates))
+    spec["data_width"] = width
     sid = _sid(spec["dut_name"])
     rdir = runs_dir(project_dir) / sid
     rdir.mkdir(parents=True, exist_ok=True)

@@ -62,3 +62,28 @@ def test_memory_roundtrip(tmp_path):
     memory_append(p, {"a": 1})
     memory_append(p, {"a": 2})
     assert [e["a"] for e in memory_read(p)] == [1, 2]
+
+
+def test_assess_prompt(monkeypatch):
+    import vlab.auto as auto_mod
+    import vlab.llm as llm_mod
+
+    assert auto_mod.assess_prompt("anything", False) == []
+    monkeypatch.setattr(llm_mod, "chat",
+                        lambda *a, **k: '{"complete": true, "questions": []}')
+    assert auto_mod.assess_prompt("8-bit counter with enable", True) == []
+    monkeypatch.setattr(
+        llm_mod, "chat",
+        lambda *a, **k: '{"complete": false, "questions": ["Sync or async reset?", "Width?"]}')
+    assert auto_mod.assess_prompt("counter", True) == ["Sync or async reset?", "Width?"]
+    monkeypatch.setattr(llm_mod, "chat",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    assert auto_mod.assess_prompt("counter", True) == []
+
+
+def test_expand_offline_defaults():
+    from vlab.auto import expand_spec
+
+    spec = expand_spec("8-bit adder", "alu8", None, False)
+    assert spec["data_width"] == 8
+    assert spec["suggested_candidates"] == 1

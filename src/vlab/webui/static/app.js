@@ -127,11 +127,15 @@ function drawWave() {
 }
 
 async function start() {
+  const numOrNull = id => {
+    const v = $(id).value.trim();
+    return v === "" ? null : +v;
+  };
   const body = {
     prompt: $("prompt").value.trim(),
     dut: $("dut").value.trim() || null,
-    width: +$("width").value || 8,
-    candidates: +$("candidates").value || 1,
+    width: numOrNull("width"),
+    candidates: numOrNull("candidates"),
     iterations: +$("iterations").value || 1,
     fix_rounds: 2,
     use_llm: $("usellm").checked,
@@ -139,15 +143,46 @@ async function start() {
   };
   if (body.prompt.length < 3) { alert("Enter a design prompt first"); return; }
   $("start").disabled = true;
-  $("progsec").classList.remove("hidden");
-  $("resec").classList.add("hidden");
-  $("log").textContent = "";
-  document.querySelectorAll("#steps li").forEach(li => li.classList.remove("on", "done"));
+  $("clarify").classList.add("hidden");
   const r = await (await api("/api/runs", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   })).json();
-  runId = r.run_id;
+  if (r.needs_input) { showQuestions(r.ticket, r.questions); $("start").disabled = false; return; }
+  beginRun(r.run_id);
+}
+
+function showQuestions(ticket, questions) {
+  const box = $("clarify");
+  box.classList.remove("hidden");
+  const ql = $("qlist");
+  ql.innerHTML = "";
+  questions.forEach((q, i) => {
+    const div = document.createElement("div");
+    div.innerHTML = `<label>${q}</label><br>`;
+    const inp = document.createElement("input");
+    inp.style.width = "100%";
+    inp.id = "qa" + i;
+    div.appendChild(inp);
+    ql.appendChild(div);
+  });
+  $("answer").onclick = async () => {
+    const answers = questions.map((_, i) => $("qa" + i).value || "");
+    const r = await (await api("/api/runs/answer", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticket, answers }),
+    })).json();
+    box.classList.add("hidden");
+    beginRun(r.run_id);
+  };
+}
+
+function beginRun(run_id) {
+  runId = run_id;
+  $("progsec").classList.remove("hidden");
+  $("resec").classList.add("hidden");
+  $("log").textContent = "";
+  document.querySelectorAll("#steps li").forEach(li => li.classList.remove("on", "done"));
   $("runid").textContent = "run: " + runId;
   if (es) es.close();
   es = new EventSource(`/api/runs/${runId}/events`);

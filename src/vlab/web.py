@@ -25,6 +25,8 @@ STEPS = ["define", "generate", "verify", "synthesize", "ppa", "select", "done"]
 # run_id -> {"queue": Queue, "done": bool}
 _RUNS: dict[str, dict[str, Any]] = {}
 _RUNS_LOCK = threading.Lock()
+# clarify tickets: ticket -> {"req": AutoRequest, "questions": list}
+_TICKETS: dict[str, dict[str, Any]] = {}
 
 
 def ui_dir() -> Path:
@@ -34,12 +36,17 @@ def ui_dir() -> Path:
 class AutoRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=2000)
     dut: str | None = None
-    width: int = Field(default=8, ge=1, le=1024)
-    candidates: int = Field(default=1, ge=1, le=8)
+    width: int | None = Field(default=None, ge=1, le=1024)
+    candidates: int | None = Field(default=None, ge=1, le=8)
     iterations: int = Field(default=1, ge=1, le=5)
     fix_rounds: int = Field(default=2, ge=0, le=5)
     use_llm: bool = True
     freq_mhz: float = Field(default=100.0, gt=0)
+
+
+class ClarifyAnswer(BaseModel):
+    ticket: str
+    answers: list[str] = Field(default_factory=list, max_length=8)
 
 
 def _workspace(project: str | None) -> Path:
@@ -218,6 +225,38 @@ def create_app(project: str | None = None) -> FastAPI:
 
     @app.post("/api/runs")
     def start_run(req: AutoRequest):
+        import uuid
+
+        from .auto import assess_prompt
+
+        # clarification gate: LLM asks for missing requirements first
+        if req.use_llm:
+            questions = assess_prompt(req.prompt.strip(), True)
+            if questions:
+                ticket = uuid.uuid4().hex[:12]
+                with _RUNS_LOCK:
+                    _TICKETS[ticket] = {"req": req, "questions": questions}
+                    while len(_TICKETS) > 100:  # bound unanswered tickets
+                        _TICKETS.pop(next(iter(_TICKETS)))
+                return {"needs_input": True, "ticket": ticket, "questions": questions}
+        return _launch(req)
+
+    @app.post("/api/runs/answer")
+    def answer_run(ans: ClarifyAnswer):
+        with _RUNS_LOCK:
+            ticket = _TICKETS.pop(ans.ticket, None)
+        if ticket is None:
+            raise HTTPException(404, "unknown or expired ticket")
+        req: AutoRequest = ticket["req"]
+        qa = [f"{q} -> {a.strip()}" for q, a in
+              zip(ticket["questions"], ans.answers) if a.strip()]
+        prompt = req.prompt.strip()
+        if qa:
+            prompt += "\nClarifications: " + "; ".join(qa)
+        req = req.model_copy(update={"prompt": prompt})
+        return _launch(req)
+
+    def _launch(req: AutoRequest) -> dict[str, str]:
         import uuid
 
         run_id = uuid.uuid4().hex[:12]
