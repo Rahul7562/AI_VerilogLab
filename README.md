@@ -15,7 +15,7 @@ cp .env.example .env   # set OPENROUTER_API_KEY (never commit .env)
 uv run vlab check-llm
 ```
 
-Default model: `poolside/laguna-s-2.1:free`
+Default model: `stealth/space-bunny-alpha`
 (`OPENROUTER_MODEL` overrides).
 
 ## EDA tools

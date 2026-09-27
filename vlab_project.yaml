@@ -1,5 +1,5 @@
 dut: dut
-model: poolside/laguna-s-2.1:free
+model: stealth/space-bunny-alpha
 pdk_choice: auto
 supported_pdks:
 - sky130
