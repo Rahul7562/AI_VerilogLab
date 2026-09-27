@@ -36,6 +36,40 @@ Request: {prompt}
 Width hint: {width}"""
 
 
+SPEC_REVIEW_PROMPT = """You review a DUT spec for internal contradictions. Check: reset behavior
+vs initial state, port directions vs features, test plan vs described behavior,
+clock/reset presence vs category. Output ONLY JSON with exactly two keys:
+{{"issues": ["<each contradiction found>"], "spec": <the FULL corrected spec JSON>}}.
+Fix contradictions minimally (prefer explicit test-plan statements). If none found,
+return the spec unchanged with "issues": [].
+Spec:
+{spec}"""
+
+
+def review_spec(spec: dict[str, Any], use_llm: bool) -> tuple[dict[str, Any], list[str]]:
+    """LLM self-review of the spec; falls back to the original on any failure."""
+    if not use_llm:
+        return spec, []
+    try:
+        from .llm import chat as llm_chat, get_api_key
+
+        if not get_api_key():
+            return spec, []
+        raw = llm_chat(
+            [{"role": "user",
+              "content": SPEC_REVIEW_PROMPT.format(spec=json.dumps(spec))}],
+            max_tokens=1500,
+            temperature=0.1,
+        )
+        obj = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+        fixed = validate_spec(obj["spec"])
+        issues = [str(i) for i in obj.get("issues", [])]
+        fixed["review_notes"] = issues
+        return fixed, issues
+    except Exception:
+        return spec, []
+
+
 def _sid(dut: str) -> str:
     return f"{dut}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -223,9 +257,9 @@ def run_auto(
         raise ValueError("max_fix_rounds must be >= 0")
 
     spec = expand_spec(prompt, dut, width, use_llm)
+    spec, spec_issues = review_spec(spec, use_llm)
     # None = LLM decided: width lives in spec, candidates in suggested_candidates
-    width = width or int(spec.get("data_width", 8))
-    try:
+    width = width or int(spec.get("data_width", 8))    try:
         candidates = candidates or int(spec.get("suggested_candidates", 1))
     except (TypeError, ValueError):
         candidates = 1
@@ -303,6 +337,7 @@ def run_auto(
         "session": sid,
         "dut": spec["dut_name"],
         "iterations": iterations,
+        "spec_issues": spec.get("review_notes", []),
         "candidates": all_cands,
         "pareto": pareto_frontier(all_cands),
         "winner": winner["id"] if winner else None,

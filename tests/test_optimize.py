@@ -95,3 +95,39 @@ def test_expand_offline_defaults():
     spec = expand_spec("8-bit adder", "alu8", None, False)
     assert spec["data_width"] == 8
     assert spec["suggested_candidates"] == 1
+
+
+def _base_spec():
+    return {
+        "dut_name": "foo", "description": "d", "category": "sequential",
+        "data_width": 1, "pdk_choice": "auto", "ports": [
+            {"name": "a", "direction": "input", "width": 1},
+            {"name": "y", "direction": "output", "width": 1}],
+    }
+
+
+def test_review_spec_fixes_contradiction(monkeypatch):
+    import json as _json
+
+    import vlab.auto as auto_mod
+    import vlab.llm as llm_mod
+
+    fixed = dict(_base_spec(), description="reset to zero")
+    monkeypatch.setattr(
+        llm_mod, "chat",
+        lambda *a, **k: _json.dumps({"issues": ["reset unclear"], "spec": fixed}))
+    out, issues = auto_mod.review_spec(_base_spec(), True)
+    assert issues == ["reset unclear"]
+    assert out["description"] == "reset to zero"
+    assert out["review_notes"] == ["reset unclear"]
+
+
+def test_review_spec_falls_back(monkeypatch):
+    import vlab.auto as auto_mod
+    import vlab.llm as llm_mod
+
+    assert auto_mod.review_spec(_base_spec(), False) == (_base_spec(), [])
+    monkeypatch.setattr(llm_mod, "chat",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    spec, issues = auto_mod.review_spec(_base_spec(), True)
+    assert spec["description"] == "d" and issues == []
