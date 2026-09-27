@@ -1,7 +1,8 @@
-"""OpenRouter client (Nemotron 3 Ultra free by default)."""
+"""OpenRouter client (default model from config; free-tier friendly)."""
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from . import config
@@ -21,6 +22,19 @@ def _headers() -> dict[str, str]:
         "HTTP-Referer": os.getenv("OPENROUTER_APP_URL", "http://localhost"),
         "X-Title": os.getenv("OPENROUTER_APP_NAME", "AI-VerilogLab"),
     }
+
+
+def _retry_after_seconds(err: Exception, default: float) -> float:
+    """Best-effort Retry-After extraction from provider errors."""
+    try:
+        resp = getattr(err, "response", None)
+        headers = getattr(resp, "headers", None) or {}
+        for key in ("retry-after", "Retry-After", "retry_after"):
+            if key in headers:
+                return max(1.0, min(300.0, float(headers[key])))
+    except (TypeError, ValueError):
+        pass
+    return default
 
 
 def _reasoning_params() -> dict[str, Any] | None:
@@ -71,6 +85,7 @@ def chat(
     reasoning = _reasoning_params()
     if reasoning:
         extra["extra_body"] = reasoning
+    boosted = False  # one free retry with doubled budget on length cutoffs
     attempts_left = retries + 1
     while attempts_left > 0:
         try:
@@ -85,9 +100,14 @@ def chat(
             choices = resp.choices or []
             text = (choices[0].message.content if choices else None) or ""
             if not text.strip():
-                raise RuntimeError(
-                    f"empty model reply (finish={getattr(choices[0] if choices else None, 'finish_reason', '?')})"
+                finish = getattr(
+                    choices[0] if choices else None, "finish_reason", "?"
                 )
+                if finish == "length" and not boosted and max_tokens < 8192:
+                    max_tokens = min(8192, max_tokens * 2)
+                    boosted = True
+                    continue  # thinking ate the budget; retry bigger, free
+                raise RuntimeError(f"empty model reply (finish={finish})")
             return text.strip()
         except Exception as e:  # noqa: BLE001 - retry transient, surface rest
             last_err = e
@@ -97,6 +117,12 @@ def chat(
                 continue
             if "401" in msg or "auth" in msg.lower() or "api key" in msg.lower():
                 break
+            if "429" in msg or "rate limit" in msg.lower():
+                used = (retries + 1) - attempts_left
+                wait = _retry_after_seconds(e, min(120.0, 15.0 * (2**used)))
+                time.sleep(wait)
+                attempts_left -= 1
+                continue
             attempts_left -= 1
     raise RuntimeError(f"LLM call failed after {retries + 1} attempt(s): {last_err}"[:500])
 

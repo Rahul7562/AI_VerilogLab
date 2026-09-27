@@ -67,6 +67,60 @@ def test_chat_no_retry_on_auth(monkeypatch):
     assert len(calls) == 1  # no retry on auth errors
 
 
+def test_chat_backs_off_on_429(monkeypatch):
+    import vlab.llm as llm_mod
+
+    calls, sleeps = [], []
+
+    class R429Completions:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) < 3:
+                err = RuntimeError("429 rate limited, slow down")
+                err.response = types.SimpleNamespace(headers={"retry-after": "7"})
+                raise err
+            msg = types.SimpleNamespace(content="late-ok")
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=msg, finish_reason="stop")])
+
+    mod = types.ModuleType("openai")
+    mod.OpenAI = lambda **kw: types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=R429Completions()))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
+    monkeypatch.setitem(sys.modules, "openai", mod)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
+    assert llm_mod.chat([{"role": "user", "content": "hi"}], retries=3) == "late-ok"
+    assert sleeps == [7.0, 7.0]  # Retry-After honored, no busy retry
+
+
+def test_chat_boosts_budget_on_length_cutoff(monkeypatch):
+    import vlab.llm as llm_mod
+
+    seen_max = []
+    msg = types.SimpleNamespace(content="finally")
+
+    class LenCompletions:
+        def create(self, **kw):
+            seen_max.append(kw.get("max_tokens"))
+            if len(seen_max) == 1:
+                return types.SimpleNamespace(choices=[
+                    types.SimpleNamespace(message=types.SimpleNamespace(content=" "),
+                                          finish_reason="length")])
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=msg, finish_reason="stop")])
+
+    mod = types.ModuleType("openai")
+    mod.OpenAI = lambda **kw: types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=LenCompletions()))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
+    monkeypatch.setitem(sys.modules, "openai", mod)
+    assert llm_mod.chat([{"role": "user", "content": "hi"}], retries=0,
+                        max_tokens=100) == "finally"
+    assert seen_max == [100, 200]  # one free retry with doubled budget
+
+
 def test_reasoning_params_default_and_off(monkeypatch):
     import vlab.llm as llm_mod
 
