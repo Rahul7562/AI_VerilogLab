@@ -58,6 +58,24 @@ uv run vlab report --project ./my_proj         # PPA.md
 uv run vlab run --project ./my_proj            # full pipeline in one go
 ```
 
+## Autonomous mode (one prompt in, results out)
+
+```bash
+uv run vlab auto --project ./my_proj \
+  --prompt "8-bit up/down counter with enable and sync reset" \
+  --dut cnt8 --candidates 2 --iterations 1
+```
+
+`auto` runs DEFINE (LLM expands the prompt to `spec.json`) → GENERATE
+(N candidates) → VERIFY (sim + `fix` repair of the working TB) → SYNTHESIZE
+→ MEASURE PPA → SELECT+LEARN (constraint check, pareto frontier,
+`memory.jsonl`, LLM search guidance for the next generation) → OUTPUT
+(`final/` with winning RTL + TB + netlist + `PPA.md`, plus `COMPARISON.md`).
+
+Correctness guard: the first passing testbench is frozen as
+`golden_tb_<dut>.v`, and repairs that drop below its PASS count are rejected,
+so optimization cannot win by weakening the test.
+
 Non-interactive (CI/tests):
 
 ```bash

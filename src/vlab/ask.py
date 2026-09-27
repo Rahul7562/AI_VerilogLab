@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -52,10 +53,8 @@ def _parse_ports(raw: str, width: int) -> list[dict[str, Any]]:
             elif d in ("inout",):
                 direction = "inout"
         # width from [msb:lsb] in name
-        w: str | int = 1
+        w = 1
         if "[" in name and "]" in name:
-            import re
-
             m = re.search(r"\[(\d+):(\d+)\]", name)
             if m:
                 msb, lsb = int(m.group(1)), int(m.group(2))

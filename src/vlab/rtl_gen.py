@@ -177,6 +177,7 @@ def run_gen(
     use_llm: bool = True,
     force: bool = False,
     max_tokens: int = 4096,
+    guidance: str = "",
 ) -> dict[str, Any]:
     """Generate design.v + tb. Returns manifest dict."""
     from .config import session_dir
@@ -197,6 +198,8 @@ def run_gen(
         if not get_api_key():
             raise RuntimeError("OPENROUTER_API_KEY not set. Use --no-llm for template.")
         prompt = GEN_PROMPT.format(dut=dut, spec=json.dumps(spec, indent=2))
+        if guidance:
+            prompt += f"\nPrior exploration guidance (follow it):\n{guidance}\n"
         raw = llm_chat(
             [
                 {

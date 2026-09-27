@@ -79,12 +79,15 @@ def _vcd_activity(vcd: Path) -> tuple[float, int, int]:
     toggles = 0
     signals = 0
     try:
-        for line in vcd.read_text(errors="ignore").splitlines():
-            s = line.strip()
-            if s.startswith("$var"):
-                signals += 1
-            elif s and s[0] in "01xXzZbB" and len(s) > 1:
-                toggles += 1
+        with open(vcd, errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i > 200000:
+                    break
+                s = line.strip()
+                if s.startswith("$var"):
+                    signals += 1
+                elif s and s[0] in "01xXzZbB" and len(s) > 1:
+                    toggles += 1
     except FileNotFoundError:
         return 0.1, 0, 0
     if signals <= 0:

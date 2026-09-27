@@ -1,6 +1,6 @@
 [project]
 name = "ai-veriloglab"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI VerilogLab - CLI driven RTL generation, simulation, synthesis and PPA"
 readme = "README.md"
 requires-python = ">=3.10"

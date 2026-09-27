@@ -1,4 +1,4 @@
-"""vlab CLI — M0-M5: init, Q&A, gen, simulate, synth, ppa, run, report."""
+"""vlab CLI: init, Q&A, gen, simulate, fix, synth, ppa, run, report, auto."""
 from __future__ import annotations
 
 import json
@@ -212,6 +212,46 @@ def ppa_cmd(
     console.print(f"[green]PPA OK:[/green] area_cells={r['area'].get('cell_count')} "
                   f"timing={r['timing'].get('method')} power={r['power'].get('method')} "
                   f"({r['power'].get('power_w')})")
+
+
+@app.command("auto")
+def auto_cmd(
+    prompt: str = typer.Option(None, "--prompt", help="One-line design request."),
+    project: str = typer.Option(None, "--project"),
+    dut: str = typer.Option(None, "--dut", help="Override module name."),
+    width: int = typer.Option(8, "--width"),
+    candidates: int = typer.Option(1, "--candidates", help="N designs per iteration."),
+    iterations: int = typer.Option(1, "--iterations", help="Search generations."),
+    fix_rounds: int = typer.Option(3, "--fix-rounds", help="TB repair rounds each."),
+    use_llm: bool = typer.Option(True, "--use-llm/--no-llm"),
+    freq_mhz: float = typer.Option(100.0, "--freq-mhz"),
+):
+    """Single prompt in -> spec -> candidates -> verify/fix -> synth/ppa -> final."""
+    from .auto import run_auto
+
+    if not prompt:
+        prompt = typer.prompt("Describe the DUT to build")
+    if not prompt.strip():
+        console.print("[red]Empty prompt.[/red]")
+        raise typer.Exit(code=1)
+    pdir = config.resolve_project_dir(project)
+    try:
+        s = run_auto(
+            pdir, prompt, dut=dut, width=width, candidates=candidates,
+            iterations=iterations, max_fix_rounds=fix_rounds,
+            use_llm=use_llm, freq_mhz=freq_mhz,
+        )
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Session:[/green] {s['session']}  "
+                  f"winner={s['winner']} final={s['final']}")
+    for c in s["candidates"]:
+        console.print(f"  {c['id'].split('__')[-1]}: {c['status']} "
+                      f"cells={c.get('cells')} crit={c.get('crit_ns')} "
+                      f"power={c.get('power_w')}")
+    if not s["final"]:
+        raise typer.Exit(code=1)
 
 
 @app.command("fix")

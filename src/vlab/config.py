@@ -81,16 +81,18 @@ def find_spec(project_dir: Path, session_id: str | None) -> tuple[str, Path]:
                 return session_id, p2
             raise FileNotFoundError(f"spec not found for session {session_id!r}")
         return session_id, p
-    # latest session by mtime
+    # latest session by mtime (skip auto candidate dirs: <sid>__i<c>c<d>)
     candidates = sorted(
-        [d for d in sdir.iterdir() if d.is_dir() and (d / "spec.json").exists()],
+        [d for d in sdir.iterdir()
+         if d.is_dir() and (d / "spec.json").exists() and "__i" not in d.name],
         key=lambda d: (d / "spec.json").stat().st_mtime,
     )
     if not candidates:
         # fallback to runs/
         rdir = runs_dir(project_dir)
         candidates = sorted(
-            [d for d in rdir.iterdir() if d.is_dir() and (d / "spec.json").exists()],
+            [d for d in rdir.iterdir()
+             if d.is_dir() and (d / "spec.json").exists() and "__i" not in d.name],
             key=lambda d: (d / "spec.json").stat().st_mtime,
         )
     if not candidates:
