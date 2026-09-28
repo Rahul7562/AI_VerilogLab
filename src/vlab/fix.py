@@ -100,10 +100,19 @@ def sanitize_testbench(tb: str, dut: str) -> tuple[str, list[str]]:
     """
     warns: list[str] = []
     lines = tb.splitlines()
-    kept = [ln for ln in lines if not ln.strip().startswith("`timescale")]
-    if len(kept) != len(lines):
-        warns.append("moved `timescale outside module definition")
-    out = "`timescale 1ns/1ps\n" + "\n".join(kept).lstrip("\n")
+    ts_idx = [i for i, ln in enumerate(lines) if ln.strip().startswith("`timescale")]
+    first_content = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    if ts_idx and ts_idx == [first_content]:
+        out = tb  # already correct: single timescale as first line
+    else:
+        kept = [ln for i, ln in enumerate(lines) if i not in ts_idx]
+        if not ts_idx:
+            warns.append("added missing `timescale 1ns/1ps")
+        else:
+            warns.append("moved `timescale outside module definition")
+        out = "`timescale 1ns/1ps\n" + "\n".join(kept).lstrip("\n")
+        if tb.endswith("\n"):
+            out += "\n"
     if f"module tb_{dut}" not in out:
         raise ValueError(f"sanitized TB names wrong module (want tb_{dut})")
     if "$finish" not in out:
