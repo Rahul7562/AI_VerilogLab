@@ -113,11 +113,19 @@ def new_cmd(
     from .ask import run_new
 
     pdir = config.resolve_project_dir(project)
-    sid, spec_path = run_new(
-        pdir, dut=dut, non_interactive=non_interactive, desc=desc,
-        width=width, pdk=pdk, use_llm=use_llm, category=category,
-    )
-    spec = json.loads(Path(spec_path).read_text())
+    try:
+        sid, spec_path = run_new(
+            pdir, dut=dut, non_interactive=non_interactive, desc=desc,
+            width=width, pdk=pdk, use_llm=use_llm, category=category,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+    try:
+        spec = json.loads(Path(spec_path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        console.print(f"[red]Cannot read spec: {e}[/red]")
+        raise typer.Exit(code=1)
     console.print(f"[green]Session:[/green] {sid}")
     console.print(f"spec: {spec_path}")
     console.print(
@@ -139,7 +147,14 @@ def gen_cmd(
 
     pdir = config.resolve_project_dir(project)
     sid, spec_path = find_spec(pdir, session)
-    m = run_gen(pdir, sid, spec_path, use_llm=use_llm, force=force)
+    try:
+        m = run_gen(pdir, sid, spec_path, use_llm=use_llm, force=force)
+    except FileExistsError as e:
+        console.print(f"[red]{e} Use --force to overwrite.[/red]")
+        raise typer.Exit(code=1)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
     console.print(f"[green]Gen OK:[/green] {m['design']} + {m['testbench']}")
     for w in m.get("warnings", []):
         console.print(f"[yellow]WARN: {w}[/yellow]")

@@ -112,12 +112,19 @@ def builtin_template(spec: dict[str, Any]) -> tuple[str, str]:
     has_clk = clk_p is not None
     rst_expr = f"!{rst_p['name']}" if rst_p and "n" in rst_p["name"].lower() else (rst_p["name"] if rst_p else "1'b0")
     if has_clk:
-        logic = (
-            f"  always @(posedge {clk_p['name']}) begin\n"
-            + (f"    if ({rst_expr}) {y['name']} <= {{{yw}{{1'b0}}}};\n" if rst_p else "")
-            + f"    else {y['name']} <= {a['name']} + {b['name']};\n"
-            f"  end"
-        )
+        if rst_p:
+            logic = (
+                f"  always @(posedge {clk_p['name']}) begin\n"
+                f"    if ({rst_expr}) {y['name']} <= {{{yw}{{1'b0}}}};\n"
+                f"    else {y['name']} <= {a['name']} + {b['name']};\n"
+                f"  end"
+            )
+        else:
+            logic = (
+                f"  always @(posedge {clk_p['name']}) begin\n"
+                f"    {y['name']} <= {a['name']} + {b['name']};\n"
+                f"  end"
+            )
     else:
         logic = f"  always @(*) {y['name']} = {a['name']} + {b['name']};"
 
@@ -146,9 +153,14 @@ def builtin_template(spec: dict[str, Any]) -> tuple[str, str]:
         if rst_p else ""
     )
     v1, v2 = 3 % (1 << aw), 4 % (1 << bw)
-    e1 = (v1 + v2) % (1 << yw)
     v3, v4 = 10 % (1 << aw), 20 % (1 << bw)
-    e2 = (v3 + v4) % (1 << yw)
+    if b["name"] == a["name"]:
+        # single data port driven twice: last assignment wins, DUT adds it to itself
+        e1 = (v2 + v2) % (1 << yw)
+        e2 = (v4 + v4) % (1 << yw)
+    else:
+        e1 = (v1 + v2) % (1 << yw)
+        e2 = (v3 + v4) % (1 << yw)
     tb = (
         f"`timescale 1ns/1ps\n"
         f"module tb_{dut};\n{tb_body}{tb_inst}{clkgen}"
