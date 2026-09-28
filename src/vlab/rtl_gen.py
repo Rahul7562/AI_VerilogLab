@@ -179,6 +179,20 @@ def builtin_template(spec: dict[str, Any]) -> tuple[str, str]:
     return design, tb
 
 
+def _require_ports(design: str, spec: dict[str, Any]) -> None:
+    """The generated DUT must expose every spec port (models invent their own)."""
+    import re as _re
+
+    ports = [p["name"] for p in spec.get("ports", [])]
+    missing = [n for n in ports if not _re.search(rf"\b{_re.escape(n)}\b", design)]
+    if missing:
+        raise ValueError(
+            "design missing spec ports: "
+            + ", ".join(missing)
+            + ". Use EXACTLY the specified port names."
+        )
+
+
 def _require_sane(design: str, tb: str, dut: str) -> None:
     """Hard reject unusable output (wrong module, TB that can't terminate)."""
     problems = []
@@ -247,6 +261,7 @@ def run_gen(
         try:
             design, tb, notes = parse_llm_output(raw, dut)
             _require_sane(design, tb, dut)
+            _require_ports(design, spec)
         except ValueError:
             # retry with the FULL prompt (truncated/placeholder first replies
             # are common on loaded free-tier models; a bare nudge invites
@@ -269,12 +284,16 @@ def run_gen(
             (outdir / "gen_raw_retry.txt").write_text(raw2)
             design, tb, notes = parse_llm_output(raw2, dut)
             _require_sane(design, tb, dut)
+            _require_ports(design, spec)
         llm_used = True
     else:
         design, tb = builtin_template(spec)
         notes = "builtin offline template (no LLM)"
 
-    warns = _validate(design, tb, dut)
+    from .fix import sanitize_testbench
+
+    tb, san_warns = sanitize_testbench(tb, dut)
+    warns = _validate(design, tb, dut) + san_warns
     design_p.write_text(design)
     tb_p.write_text(tb)
     manifest = {

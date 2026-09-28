@@ -188,6 +188,7 @@ def _verify_candidate(
         design_repair_prompt,
         is_compile_fail,
         repair_prompt,
+        sanitize_testbench,
     )
     from .llm import chat as llm_chat
     from .sim import run_simulate
@@ -196,6 +197,7 @@ def _verify_candidate(
     spec = json.loads((outdir / "spec.json").read_text())
     dut = spec["dut_name"]
     repairs = 0
+    last_err = ""
     # freeze golden on first PASS (tb + pass count as anti-weakening bar)
     for _ in range(max_fix_rounds + 1):
         design = (outdir / "design.v").read_text()
@@ -242,13 +244,15 @@ def _verify_candidate(
                 _require_design_intact(fixed, dut, spec.get("ports", []))
                 (outdir / "design.v").write_text(fixed)
             else:
-                fixed = _extract_tb(raw, dut)
+                fixed, _ = sanitize_testbench(_extract_tb(raw, dut), dut)
                 (outdir / f"tb_{dut}.v").write_text(fixed)
         except ValueError as e:
+            last_err = str(e)[:200]
             repairs += 1  # truncated/garbled output: count round, retry
             continue
         repairs += 1
-    return {"status": "fail", "passes": 0, "fails": 0, "repairs": repairs}
+    return {"status": "fail", "passes": 0, "fails": 0, "repairs": repairs,
+            "note": last_err}
 
 
 def run_auto(

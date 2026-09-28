@@ -111,6 +111,24 @@ def test_extract_tb_fence_and_raw():
         _extract_tb("no verilog here", "baz")
 
 
+def test_sanitize_testbench():
+    from vlab.fix import sanitize_testbench
+
+    bad = ("module tb_foo;\n\n    `timescale 1ns/1ps\n\n"
+           "    reg clk;\n    $finish;\nendmodule\n")
+    fixed, warns = sanitize_testbench(bad, "foo")
+    assert fixed.startswith("`timescale 1ns/1ps\nmodule tb_foo;")
+    assert "`timescale" not in fixed.split("module tb_foo;")[1]
+    assert warns  # reports the move
+    good = "`timescale 1ns/1ps\nmodule tb_foo;\n$finish;\nendmodule\n"
+    fixed2, warns2 = sanitize_testbench(good, "foo")
+    assert fixed2 == good and warns2 == []  # idempotent
+    with pytest.raises(ValueError, match="\\$finish"):
+        sanitize_testbench("module tb_foo;\nendmodule\n", "foo")
+    with pytest.raises(ValueError, match="wrong module"):
+        sanitize_testbench("module tb_x;\n$finish;\nendmodule\n", "foo")
+
+
 def test_require_sane():
     from vlab.rtl_gen import _require_sane
 
@@ -178,3 +196,46 @@ def test_gen_double_failure_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_mod, "chat", lambda *a, **k: "thinking prose, no code")
     with pytest.raises(ValueError):
         run_gen(proj, "s1", proj / "runs" / "s1" / "spec.json", use_llm=True)
+
+
+def test_require_ports():
+    from vlab.rtl_gen import _require_ports
+
+    spec = {"ports": [{"name": "clk"}, {"name": "weird_sig"}]}
+    _require_ports("module d(input clk, input weird_sig); endmodule", spec)
+    with pytest.raises(ValueError, match="weird_sig"):
+        _require_ports("module d(input clk, input other); endmodule", spec)
+
+
+def test_gen_retries_on_port_mismatch(tmp_path, monkeypatch):
+    import json as _json
+
+    import vlab.llm as llm_mod
+    from vlab.rtl_gen import run_gen
+
+    spec = {
+        "dut_name": "foo", "description": "d", "category": "sequential",
+        "data_width": 1, "pdk_choice": "auto", "ports": [
+            {"name": "a", "direction": "input", "width": 1},
+            {"name": "y", "direction": "output", "width": 1}],
+    }
+    proj = tmp_path / "p"
+    (proj / "sessions" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1" / "spec.json").write_text(_json.dumps(spec))
+    wrong = _json.dumps({
+        "design": "module foo(input q, output z); assign z = q; endmodule",
+        "testbench": "module tb_foo; $dumpfile(\"w\"); $finish; endmodule"})
+    right = _json.dumps({
+        "design": "module foo(input a, output y); assign y = a; endmodule",
+        "testbench": "module tb_foo; $dumpfile(\"w\"); $finish; endmodule"})
+    calls = {"n": 0}
+
+    def fake_chat(*a, **k):
+        calls["n"] += 1
+        return wrong if calls["n"] == 1 else right
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    m = run_gen(proj, "s1", proj / "runs" / "s1" / "spec.json", use_llm=True)
+    assert calls["n"] == 2
+    assert "input a" in open(proj / "runs" / "s1" / "design.v").read()

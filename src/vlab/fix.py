@@ -92,6 +92,25 @@ def _slice_module(text: str, dut: str) -> str:
     return text[start : end + len("endmodule")].strip()
 
 
+def sanitize_testbench(tb: str, dut: str) -> tuple[str, list[str]]:
+    """Deterministic TB fixes (no LLM): `timescale must precede the module.
+
+    Returns (fixed_tb, warnings). Raises ValueError when the TB is
+    structurally unusable (wrong module, no $finish -> would hang sim).
+    """
+    warns: list[str] = []
+    lines = tb.splitlines()
+    kept = [ln for ln in lines if not ln.strip().startswith("`timescale")]
+    if len(kept) != len(lines):
+        warns.append("moved `timescale outside module definition")
+    out = "`timescale 1ns/1ps\n" + "\n".join(kept).lstrip("\n")
+    if f"module tb_{dut}" not in out:
+        raise ValueError(f"sanitized TB names wrong module (want tb_{dut})")
+    if "$finish" not in out:
+        raise ValueError("sanitized TB missing $finish (would hang the simulator)")
+    return out, warns
+
+
 def is_compile_fail(sim: dict, log: str) -> bool:
     """True when simulation never ran (compile errors) — repair the DUT."""
     if sim.get("rc", 0) != 0 and "PASS" not in log and "FAIL" not in log:
@@ -173,7 +192,9 @@ def run_fix(
                 _require_design_intact(fixed, dut, spec.get("ports", []))
                 (outdir / "design.v").write_text(fixed)
             else:
-                fixed = _extract_tb(raw, dut)
+                fixed, san_warns = sanitize_testbench(_extract_tb(raw, dut), dut)
+                if san_warns:
+                    entry["note"] = "; ".join(san_warns)
                 (outdir / f"tb_{dut}.v").write_text(fixed)
         except ValueError as e:
             entry["note"] = str(e)[:200]
