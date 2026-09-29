@@ -244,6 +244,7 @@ def _verify_candidate(
         design_repair_prompt,
         repair_prompt,
         repair_target,
+        sanitize_design,
         sanitize_testbench,
     )
     from .llm import chat as llm_chat
@@ -306,6 +307,7 @@ def _verify_candidate(
             if target == "design":
                 fixed = _extract_design(raw, dut)
                 _require_design_intact(fixed, dut, spec.get("ports", []))
+                fixed, _ = sanitize_design(fixed)
             else:
                 fixed, _ = sanitize_testbench(_extract_tb(raw, dut), dut)
         except ValueError as e:

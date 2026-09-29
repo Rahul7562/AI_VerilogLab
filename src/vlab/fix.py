@@ -108,13 +108,49 @@ def _slice_module(text: str, dut: str) -> str:
     return sliced
 
 
+def _fix_backtick_timescale(src: str) -> tuple[str, list[str]]:
+    """Restore a missing backtick on a `timescale directive.
+
+    Some models emit a bare `timescale 1ns/1ps` with no leading backtick.
+    That is not a directive, it is an undefined identifier, and iverilog
+    rejects the file with `design.v:1: syntax error`. Since `timescale` is a
+    reserved word it can never legitimately be a user identifier, so the
+    repair is safe to make without consulting a model.
+    """
+    warns: list[str] = []
+    out_lines: list[str] = []
+    for line in src.splitlines():
+        m = re.match(r"^(\s*)timescale\s+(\S+\s*/\s*\S+)\s*$", line)
+        if m:
+            out_lines.append(f"{m.group(1)}`{m.group(0).lstrip()}")
+            warns.append("restored missing backtick on `timescale directive")
+        else:
+            out_lines.append(line)
+    out = "\n".join(out_lines)
+    if src.endswith("\n"):
+        out += "\n"
+    return out, warns
+
+
+def sanitize_design(design: str) -> tuple[str, list[str]]:
+    """Deterministic DUT fixes (no LLM). Currently just `timescale repair.
+
+    The design is synthesized as well as simulated, and a botched directive
+    is a hard compile error, so this runs before design.v is written.
+    """
+    return _fix_backtick_timescale(design)
+
+
 def sanitize_testbench(tb: str, dut: str) -> tuple[str, list[str]]:
-    """Deterministic TB fixes (no LLM): `timescale must precede the module.
+    """Deterministic TB fixes (no LLM): repair a botched `timescale, then make
+    sure it precedes the module.
 
     Returns (fixed_tb, warnings). Raises ValueError when the TB is
     structurally unusable (wrong module, no $finish -> would hang sim).
     """
     warns: list[str] = []
+    tb, ts_warns = _fix_backtick_timescale(tb)
+    warns += ts_warns
     lines = tb.splitlines()
     ts_idx = [i for i, ln in enumerate(lines) if ln.strip().startswith("`timescale")]
     first_content = next((i for i, ln in enumerate(lines) if ln.strip()), None)
@@ -251,6 +287,7 @@ def run_fix(
             if target == "design":
                 fixed = _extract_design(raw, dut)
                 _require_design_intact(fixed, dut, spec.get("ports", []))
+                fixed, _ = sanitize_design(fixed)
             else:
                 fixed, san_warns = sanitize_testbench(_extract_tb(raw, dut), dut)
                 if san_warns:

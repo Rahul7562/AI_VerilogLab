@@ -385,10 +385,14 @@ def run_gen(
         design, tb = builtin_template(spec)
         notes = "builtin offline template (no LLM)"
 
-    from .fix import sanitize_testbench
+    from .fix import sanitize_design, sanitize_testbench
 
+    # Both files are compiled by iverilog and yosys, so a botched directive
+    # fails the whole candidate. Fix deterministically rather than spending
+    # a repair round on a one-character mistake.
+    design, d_warns = sanitize_design(design)
     tb, san_warns = sanitize_testbench(tb, dut)
-    warns = warns_pre + _validate(design, tb) + san_warns
+    warns = warns_pre + d_warns + _validate(design, tb) + san_warns
     design_p.write_text(design)
     tb_p.write_text(tb)
     manifest = {

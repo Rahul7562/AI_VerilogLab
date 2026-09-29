@@ -163,7 +163,8 @@ cp -r extract/usr/share/verilator ~/.local/edatools/usr/share/
 
 ## Models
 
-Default: `poolside/laguna-s-2.1:free` (`OPENROUTER_MODEL` overrides).
+Default: `stealth/space-bunny-alpha` (`OPENROUTER_MODEL` overrides) — free,
+1M context, and verified to support `reasoning_effort`.
 
 **Free-tier rotation.** OpenRouter rate-limits the free tier *per model*,
 and the popular free models are frequently saturated — a 429 on one model
@@ -189,6 +190,20 @@ uv run vlab models --probe      # which models answer right now
 > never both — OpenRouter returns HTTP 400 for a request carrying both.
 > Prefer `low`/`medium`/`high`; `exclude` asks the provider to strip
 > reasoning, which some thinking models answer with empty content.
+
+### Model quirks vlab handles for you
+
+Deterministic sanitizers run on generated output, so a model slip costs a
+warning rather than a failed candidate:
+
+- **Missing backtick on `timescale`.** A bare `timescale 1ns/1ps` is an
+  undefined identifier, not a directive, and iverilog rejects the file with
+  `design.v:1: syntax error`. Both `design.v` and the testbench are repaired
+  automatically; the repair is recorded in `gen.json` warnings.
+- **Unparsable JSON or a wrong module name** — the reply is retried once
+  with the reason it was rejected, then the candidate is marked failed.
+- **Ports the model invented** are rejected against the spec, in both the
+  design header and the testbench.
 
 ## PDKs
 

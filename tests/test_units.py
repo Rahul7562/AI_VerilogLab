@@ -323,6 +323,75 @@ def test_sta_liberty_uses_recorded_liberty(tmp_path):
     assert got.name == "generic.lib" and got.exists()
 
 
+def test_sanitize_design_restores_missing_backtick():
+    """Some models emit a `timescale directive with no leading backtick.
+
+    That is an undefined identifier, not a directive, so iverilog rejects
+    the file with `design.v:1: syntax error` and the whole candidate dies.
+    `timescale` is a reserved word, so repairing it needs no model call.
+    """
+    from vlab.fix import sanitize_design
+
+    bad = "timescale 1ns/1ps\nmodule d(input a, output y);\nassign y = a;\nendmodule\n"
+    fixed, warns = sanitize_design(bad)
+    assert fixed.startswith("`timescale 1ns/1ps\n")
+    assert warns
+    # a correct directive is left completely alone
+    good = "`timescale 1ns/1ps\nmodule d; endmodule\n"
+    same, w2 = sanitize_design(good)
+    assert same == good
+    assert w2 == []
+    # indentation is preserved
+    ind, _ = sanitize_design("  timescale 10ns / 1ns\nmodule d; endmodule\n")
+    assert ind.startswith("  `timescale 10ns / 1ns")
+    # must not touch identifiers that merely contain the word
+    keep, kw = sanitize_design("module d; wire timescale_ok; endmodule\n")
+    assert "`" not in keep
+    assert kw == []
+    # trailing newline preserved
+    assert sanitize_design("timescale 1ns/1ps\n")[0].endswith("\n")
+
+
+def test_sanitize_testbench_also_repairs_backtick():
+    from vlab.fix import sanitize_testbench
+
+    bad = "timescale 1ns/1ps\nmodule tb_foo;\n  $finish;\nendmodule\n"
+    fixed, warns = sanitize_testbench(bad, "foo")
+    assert fixed.startswith("`timescale 1ns/1ps\n")
+    assert any("backtick" in w for w in warns)
+
+
+def test_run_gen_applies_design_sanitizer(tmp_path, monkeypatch):
+    """The repair must reach design.v, not just the returned string."""
+    import json as _json
+
+    import vlab.llm as llm_mod
+    from vlab.rtl_gen import run_gen
+
+    spec = {
+        "dut_name": "foo", "description": "d", "category": "sequential",
+        "data_width": 1, "pdk_choice": "auto", "ports": [
+            {"name": "a", "direction": "input", "width": 1},
+            {"name": "y", "direction": "output", "width": 1}],
+    }
+    proj = tmp_path / "p"
+    (proj / "sessions" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1").mkdir(parents=True)
+    (proj / "runs" / "s1" / "spec.json").write_text(_json.dumps(spec))
+    reply = _json.dumps({
+        "design": ("timescale 1ns/1ps\nmodule foo(input a, output y); "
+                   "assign y = a; endmodule"),
+        "testbench": ("timescale 1ns/1ps\nmodule tb_foo; reg a; wire y; "
+                      "foo u(a,y); initial begin a=1; #1; "
+                      "if (y) $display(\"PASS: y\"); $finish; end endmodule"),
+    })
+    monkeypatch.setattr(llm_mod, "chat", lambda *a, **k: reply)
+    m = run_gen(proj, "s1", proj / "runs" / "s1" / "spec.json", use_llm=True)
+    written = (proj / "runs" / "s1" / "design.v").read_text()
+    assert written.startswith("`timescale")
+    assert any("backtick" in w for w in m["warnings"])
+
+
 def test_builtin_template_dynamic_ports():
     spec = {
         "dut_name": "mydut",
