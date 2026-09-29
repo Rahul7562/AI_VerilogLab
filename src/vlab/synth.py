@@ -6,7 +6,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .config import generic_lib_path, resolve_tool, session_dir, tool_env
+from .config import (
+    generic_lib_path,
+    pdk_lib_path,
+    resolve_tool,
+    session_dir,
+    tool_env,
+)
 from .utils import run_logged
 
 
@@ -35,13 +41,15 @@ def _find_liberty(explicit: str | None, pdk: str | None) -> Path | None:
     if explicit:
         p = Path(explicit)
         if p.exists():
-            return p
+            # Must be absolute: yosys runs with cwd=outdir, and ppa later
+            # re-reads this path from the area.json record. A relative path
+            # resolves against two different directories and fails both.
+            return p.resolve()
         raise FileNotFoundError(f"liberty not found: {explicit}")
-    # per-PDK lib if user drops one in pdks/<pdk>.lib
-    if pdk:
-        cand = Path(__file__).resolve().parents[2] / "pdks" / f"{pdk}.lib"
-        if cand.exists():
-            return cand
+    # per-PDK lib if the user dropped one into pdks/<pdk>.lib
+    per_pdk = pdk_lib_path(pdk)
+    if per_pdk:
+        return per_pdk
     g = generic_lib_path()
     return g if g.exists() else None
 
@@ -107,5 +115,9 @@ def run_synth(
     }
     (outdir / "synth.json").write_text(json.dumps(res, indent=2))
     if rc != 0 or not netlist.exists():
+        # area.json was already written above from a log that may only
+        # contain an error; don't leave a bogus cell_count behind
+        area["error"] = f"yosys rc={rc}"
+        (outdir / "area.json").write_text(json.dumps(area, indent=2))
         raise RuntimeError(f"yosys failed rc={rc}. See {outdir / 'synth.log'}")
     return res

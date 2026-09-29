@@ -18,6 +18,34 @@ uv run vlab check-llm
 Default model: `poolside/laguna-s-2.1:free`
 (`OPENROUTER_MODEL` overrides).
 
+**Free-tier model rotation.** OpenRouter's free tier rate-limits *per model*,
+and the popular free models are frequently saturated. vlab tries the primary
+model first and, on a 429/5xx/"no endpoints available" error, rotates through a
+fallback pool rather than sleeping through the limit. Key-level problems
+(401 auth, 402 no credits) are never masked by rotation — they surface
+immediately.
+
+```bash
+uv run vlab models               # show the rotation order
+uv run vlab models --probe       # live-test which models answer right now
+uv run vlab check-llm --probe    # same sweep, inside the health check
+```
+
+Set `VLAB_LLM_FALLBACKS=a:free,b:free` to override the pool, or
+`VLAB_LLM_FALLBACKS=` (empty) to disable rotation.
+
+Other knobs (`.env` or environment):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VLAB_LLM_RETRIES` | `2` | attempts **per model** before rotating |
+| `VLAB_LLM_MIN_INTERVAL` | `3.0` | client-side seconds between calls |
+| `VLAB_REASONING_EFFORT` | `low` | `off` / `exclude` / `low` / `medium` / `high` / `tokens` |
+| `VLAB_REASONING_MAX_TOKENS` | `512` | only used with `VLAB_REASONING_EFFORT=tokens` |
+
+> `VLAB_REASONING_EFFORT` sends either `effort` **or** `max_tokens`, never
+> both — OpenRouter rejects a request carrying both with HTTP 400.
+
 ## EDA tools
 
 Debian/Ubuntu with root:
@@ -43,6 +71,11 @@ cp -r extract/usr/share/verilator ~/.local/edatools/usr/share/
 `VLAB_YOSYS_BIN`, `VLAB_STA_BIN`, `VLAB_ABC_BIN`, `VLAB_IVERILOG_BASE`.
 Bundled OpenSTA is 2.0.x: no `read_vcd`, so power uses VCD-derived switching
 activity via `set_power_activity` + `report_power` (method `opensta+vcd-activity`).
+
+`iverilog` is the default simulator and is the only one that needs nothing
+extra. `verilator` is an alternative but its `--binary` mode shells out to
+`make` and a C++ compiler, so it needs `build-essential`; without them vlab
+says so instead of failing with an opaque build error.
 
 ## Flow
 
@@ -109,11 +142,34 @@ drop a real `<pdk>.lib` into `pdks/` or pass `--lib` for real mapping).
 ## PPA method (locked)
 
 * Area: `yosys stat` cell/wire counts (`area.json`).
-* Timing: `openSTA report_checks` with generated SDC
-  (clock + 20% input/output delay margins) -> WNS/TNS/crit (`ppa.json`).
+* Timing: `openSTA report_checks -path_delay max -group_count 50` with a
+  generated SDC (clock + 20% input/output delay margins) -> WNS/TNS/crit
+  (`ppa.json`). Data-input/output port lists are built by an explicit Tcl
+  walk, because OpenSTA 2.0.x evaluates `[all_inputs -no_clocks]` to an
+  *empty* set and silently drops every input delay — which hid all
+  input->register paths and made a flip-flop->output hop look like the
+  critical path. `fmax` comes from the achievable period (target period
+  minus WNS), not `1/crit_ns`, so it accounts for setup and the I/O budget.
 * Power: `openSTA report_power` with VCD-derived activity
-  (`set_power_activity`), plus VCD toggle fallback.
+  (`set_power_activity`), plus VCD toggle fallback. STA always reads the
+  same liberty synthesis mapped against.
 * Waveform: `wave.vcd` (GTKWave-compatible). Netlist: `netlist.v` + `netlist.json`.
+
+A purely combinational netlist has no startpoint->capture path: `crit_ns`
+and `wns_ns` come back `None` and `method` is `opensta-incomplete`.
+
+## Troubleshooting
+
+**Every candidate failed on an LLM call.** The free tier is rate-limited or
+unreachable. `vlab models --probe` shows which models are answering right
+now; vlab rotates the pool automatically, and a paid `OPENROUTER_MODEL`
+removes the constraint.
+
+**A candidate failed with a compile error.** Read
+`runs/<sid>__i<c>c<d>/sim.log`. vlab blames the file iverilog named in the
+error, so a testbench bug is repaired in the testbench and a DUT bug in the
+DUT. A repair that returns the file unchanged stops immediately instead of
+burning the remaining rounds.
 
 ## Layout
 

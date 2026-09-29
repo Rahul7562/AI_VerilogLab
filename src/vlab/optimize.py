@@ -14,11 +14,27 @@ def candidate_metrics(
     timing: dict[str, Any],
     power: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize area/timing/power dicts into comparable metric floats."""
+    """Normalize area/timing/power dicts into comparable metric floats.
+
+    fmax comes from the *achievable* period (target period minus worst
+    slack), not 1/crit_ns. 1/crit ignores the input/output delay budget and
+    setup time, so it overstates fmax; period-minus-slack is the standard
+    estimate for the next faster operating point. Falls back to 1/crit when
+    the target period is unknown.
+    """
     cells = area.get("cell_count", area.get("area_cells"))
     crit = timing.get("crit_ns")
     pw = power.get("power_w")
-    fmax = round(1000.0 / crit, 2) if isinstance(crit, (int, float)) and crit > 0 else None
+    fmax = None
+    period = timing.get("period_ns")
+    wns = timing.get("wns_ns")
+    if (isinstance(period, (int, float)) and period > 0
+            and isinstance(wns, (int, float))):
+        budget = period - wns
+        if budget > 0:
+            fmax = round(1000.0 / budget, 2)
+    if fmax is None and isinstance(crit, (int, float)) and crit > 0:
+        fmax = round(1000.0 / crit, 2)
     return {
         "cells": cells if isinstance(cells, (int, float)) else None,
         "crit_ns": crit if isinstance(crit, (int, float)) else None,
@@ -32,39 +48,50 @@ def candidate_metrics(
 def check_constraints(
     metrics: dict[str, Any], limits: dict[str, Any]
 ) -> dict[str, Any]:
-    """Compare metrics against spec limits. Missing metric/limit = unchecked (None)."""
+    """Compare metrics against spec limits. Missing metric/limit = unchecked (None).
+
+    A metric that was never measured must NOT count as a violation. Without
+    STA there is no fmax, and `expand_spec` always sets min_freq_mhz, so the
+    old falsy check stamped every candidate feasible=false and ranked it
+    below candidates that merely lacked constraint data.
+    """
     res: dict[str, Any] = {}
     min_freq = limits.get("min_freq_mhz")
     max_cells = limits.get("max_cells")
     max_power = limits.get("max_power_w")
     fmax = metrics.get("fmax_mhz")
-    res["freq_ok"] = (fmax is not None and fmax >= min_freq) if min_freq else None
-    res["area_ok"] = (
-        metrics["cells"] is not None and metrics["cells"] <= max_cells
-    ) if max_cells else None
-    res["power_ok"] = (
-        metrics["power_w"] is not None and metrics["power_w"] <= max_power
-    ) if max_power else None
+    cells = metrics.get("cells")
+    power = metrics.get("power_w")
+    res["freq_ok"] = None if fmax is None or min_freq is None else fmax >= min_freq
+    res["area_ok"] = None if cells is None or max_cells is None else cells <= max_cells
+    res["power_ok"] = None if power is None or max_power is None else power <= max_power
     checks = [v for v in res.values() if v is not None]
     res["feasible"] = all(checks) if checks else None
     return res
 
 
 def dominates(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """True if a is no-worse on all metrics and strictly better on >=1.
+    """True if a is no-worse on all *comparable* metrics and strictly better on >=1.
 
-    Lower is better for cells/crit/power. None (missing) never dominates.
+    Lower is better for cells/crit/power. A metric missing on either side is
+    skipped rather than treated as a disqualifier: bailing out on the first
+    None put every candidate on the Pareto front whenever STA or the VCD was
+    unavailable, which made search_guidance tell the model that all designs
+    were simultaneously optimal. A dominance claim still requires at least
+    one shared metric, so two fully-unmeasured candidates never "dominate".
     """
     better = False
+    compared = 0
     for k in METRIC_KEYS:
         av, bv = a.get(k), b.get(k)
         if av is None or bv is None:
-            return False
+            continue
+        compared += 1
         if av > bv:
             return False
         if av < bv:
             better = True
-    return better
+    return better and compared > 0
 
 
 def pareto_frontier(cands: list[dict[str, Any]]) -> list[int]:
@@ -125,7 +152,6 @@ def memory_read(mem_path: Path, tail: int = 20) -> list[dict[str, Any]]:
 
 def search_guidance(
     spec: dict[str, Any],
-    memory: list[dict[str, Any]],
     pareto_idx: list[int],
     cands: list[dict[str, Any]],
 ) -> str:

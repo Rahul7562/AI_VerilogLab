@@ -6,6 +6,7 @@ Run with `vlab serve`. No auth (localhost only by default).
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -28,6 +29,8 @@ _RUNS: dict[str, dict[str, Any]] = {}
 _RUNS_LOCK = threading.Lock()
 # clarify tickets: ticket -> {"req": AutoRequest, "questions": list}
 _TICKETS: dict[str, dict[str, Any]] = {}
+# serialises the on-disk run registry read-modify-write
+_REGISTRY_LOCK = threading.Lock()
 
 
 def ui_dir() -> Path:
@@ -61,13 +64,24 @@ def _workspace(project: str | None) -> Path:
     return pdir
 
 
-def _register_run(run_id: str) -> None:
+def _register_run(run_id: str, stop: threading.Event | None = None) -> None:
     now = time.time()
     with _RUNS_LOCK:
+        # bound memory: drop the oldest finished runs, keep active ones
+        if len(_RUNS) > 200:
+            done = sorted(
+                (k for k, v in _RUNS.items() if v.get("done")),
+                key=lambda k: _RUNS[k].get("created", 0.0),
+            )
+            for k in done:
+                if len(_RUNS) <= 200:
+                    break
+                _RUNS.pop(k, None)
         _RUNS[run_id] = {
             "queue": queue.Queue(maxsize=2000), "done": False,
             "created": now, "last_event": now, "status": "running",
-            "detail": "", "steps": {},
+            "detail": "", "steps": {}, "finished": False, "run_dir": None,
+            "stop": stop or threading.Event(),
         }
 
 
@@ -88,7 +102,15 @@ def _emit(run_id: str, event: dict[str, Any]) -> None:
         try:
             run["queue"].put_nowait(event)
         except queue.Full:
-            pass
+            # Drop the OLDEST event and retry, so a slow reader loses history
+            # rather than the newest state. Without the retry, run["steps"]
+            # is already mutated above and the polling endpoint reports
+            # progress the SSE stream never delivered.
+            try:
+                run["queue"].get_nowait()
+                run["queue"].put_nowait(event)
+            except (queue.Empty, queue.Full):
+                pass
 
 
 def _sibling_cands(run_dir: Path) -> list[Path]:
@@ -188,16 +210,22 @@ def _monitor(run_id: str, run_dir: Path, stop: threading.Event) -> None:
                 if not p.exists():
                     continue
                 key = f"{cdir.name}/{log}"
+                off = offsets.get(key, 0)
                 try:
-                    data = p.read_bytes()
+                    size = p.stat().st_size
+                    if size < off:  # truncated/rotated
+                        off = 0
+                    if size <= off:
+                        continue
+                    # read only the new tail; re-reading whole files every
+                    # 500 ms is O(n) per log per tick
+                    with p.open("rb") as fh:
+                        fh.seek(off)
+                        chunk = fh.read().decode("utf-8", "replace")
+                    offsets[key] = off + len(chunk.encode("utf-8", "replace"))
                 except OSError:
                     continue
-                off = offsets.get(key, 0)
-                if len(data) < off:  # truncated/rotated
-                    off = 0
-                if len(data) > off:
-                    chunk = data[off:].decode("utf-8", "replace")
-                    offsets[key] = len(data)
+                if chunk:
                     _emit(run_id, {
                         "type": "log", "source": key,
                         "lines": chunk.splitlines()[-200:],
@@ -205,37 +233,79 @@ def _monitor(run_id: str, run_dir: Path, stop: threading.Event) -> None:
         if (run_dir / "auto.json").exists():
             idle_rounds += 1
             if idle_rounds >= 3:
-                _emit(run_id, {"type": "done", "state": snap})
+                # the worker sets _RUNS[run]["finished"] when run_auto
+                # returns; waiting for that (bounded) means the final
+                # snapshot is complete instead of racing the writer
                 with _RUNS_LOCK:
-                    if run_id in _RUNS:
-                        _RUNS[run_id]["done"] = True
+                    worker_done = _RUNS.get(run_id, {}).get("finished", False)
+                if worker_done or idle_rounds >= 20:
+                    _emit(run_id, {"type": "done", "state": snap})
+                    with _RUNS_LOCK:
+                        if run_id in _RUNS:
+                            _RUNS[run_id]["done"] = True
+                    return
+        else:
+            # the worker died before writing auto.json (error path): there is
+            # nothing left to watch, so do not spin on this run forever
+            with _RUNS_LOCK:
+                worker_gone = bool(_RUNS.get(run_id, {}).get("finished")) and \
+                    bool(_RUNS.get(run_id, {}).get("done"))
+            if worker_gone:
                 return
         time.sleep(0.5)
 
 
-def _run_auto_bg(run_id: str, pdir: Path, req: AutoRequest) -> None:
+def _run_auto_bg(
+    run_id: str,
+    pdir: Path,
+    req: AutoRequest,
+    stop: threading.Event | None = None,
+) -> None:
     from .auto import run_auto
 
     run_dir: Path | None = None
+    failed: str | None = None
+
+    def _publish(d: Path) -> None:
+        # the monitor can attach as soon as the session dir exists, instead
+        # of scanning runs/ and possibly grabbing a concurrent run's dir
+        with _RUNS_LOCK:
+            if run_id in _RUNS:
+                _RUNS[run_id]["run_dir"] = str(d)
+        _registry_write(pdir, run_id, d.name)
+
     try:
         s = run_auto(
             pdir, req.prompt, dut=req.dut, width=req.width,
             candidates=req.candidates, iterations=req.iterations,
             max_fix_rounds=req.fix_rounds, use_llm=req.use_llm,
-            freq_mhz=req.freq_mhz,
+            freq_mhz=req.freq_mhz, on_session=_publish,
         )
         run_dir = pdir / "runs" / s["session"]
         _registry_write(pdir, run_id, s["session"])
     except Exception as e:  # noqa: BLE001 - surface to UI
-        _emit(run_id, {"type": "error", "message": f"{type(e).__name__}: {e}"[:500]})
+        failed = f"{type(e).__name__}: {e}"[:500]
+        # resolve the monitor before reporting, so a monitor waiting for a
+        # session dir that will never appear stops waiting
+        with _RUNS_LOCK:
+            if run_id in _RUNS:
+                _RUNS[run_id]["finished"] = True
+        _emit(run_id, {"type": "error", "message": failed})
     finally:
-        # monitor flushes final state; ensure stream terminates
-        time.sleep(2.5)
+        with _RUNS_LOCK:
+            if run_id in _RUNS:
+                _RUNS[run_id]["finished"] = True
+        if run_dir is not None and failed is None:
+            # let the monitor flush the last log/step events first
+            time.sleep(1.5)
+            _emit(run_id, {"type": "done", "state": _snapshot(run_dir)})
+        # signal the monitor to stop polling: it is a daemon thread, but on a
+        # long-lived server it would otherwise spin for its full timeout
+        if stop is not None:
+            stop.set()
         with _RUNS_LOCK:
             if run_id in _RUNS:
                 _RUNS[run_id]["done"] = True
-        if run_dir is not None:
-            _emit(run_id, {"type": "done", "state": _snapshot(run_dir)})
 
 
 def create_app(project: str | None = None) -> FastAPI:
@@ -293,21 +363,23 @@ def create_app(project: str | None = None) -> FastAPI:
         prompt = req.prompt.strip()
         if qa:
             prompt += "\nClarifications: " + "; ".join(qa)
-        req = req.model_copy(update={"prompt": prompt})
+        # model_copy skips validation, so the concatenation can exceed the
+        # declared limit; clamp so downstream prompts stay bounded
+        req = req.model_copy(update={"prompt": prompt[:2000]})
         return _launch(req)
 
     def _launch(req: AutoRequest) -> dict[str, str]:
         import uuid
 
         run_id = uuid.uuid4().hex[:12]
-        _register_run(run_id)
         stop = threading.Event()
+        _register_run(run_id, stop)
         # monitor starts immediately; worker fills artifacts as it goes
         threading.Thread(
             target=_monitor_wait_sid, args=(run_id, pdir, stop), daemon=True
         ).start()
         threading.Thread(
-            target=_run_auto_bg, args=(run_id, pdir, req), daemon=True
+            target=_run_auto_bg, args=(run_id, pdir, req, stop), daemon=True
         ).start()
         return {"run_id": run_id}
 
@@ -322,13 +394,13 @@ def create_app(project: str | None = None) -> FastAPI:
                 raise HTTPException(404, "unknown run")
             return {
                 "run_id": run_id, "pending": True,
-                "meta": _run_meta(run_id, run),
+                "meta": _run_meta(run),
             }
         snap = _snapshot(run_dir)
         snap["run_id"] = run_id
         with _RUNS_LOCK:
             run = _RUNS.get(run_id)
-        snap["meta"] = _run_meta(run_id, run)
+        snap["meta"] = _run_meta(run)
         return snap
 
     @app.get("/api/runs/{run_id}/events")
@@ -391,7 +463,7 @@ def create_app(project: str | None = None) -> FastAPI:
         run_dir = _find_run_dir(pdir, run_id)
         if run_dir is None:
             raise HTTPException(404, "unknown run")
-        if ".." in fname.split("/"):
+        if ".." in fname.replace("\\", "/").split("/"):
             raise HTTPException(404, "no such file")
         parts = fname.split("/", 1)
         if len(parts) == 2 and parts[0] in {c.name for c in _sibling_cands(run_dir)}:
@@ -399,7 +471,10 @@ def create_app(project: str | None = None) -> FastAPI:
             target = (base / parts[1]).resolve()
         else:
             target = (run_dir / fname).resolve()
-        if not str(target).startswith(str((pdir / "runs").resolve())):
+        # Path-prefix check, not str.startswith: "/p/runs_evil" would pass
+        # a string prefix test against "/p/runs".
+        runs_root = (pdir / "runs").resolve()
+        if runs_root != target and runs_root not in target.parents:
             raise HTTPException(404, "no such file")
         if not target.is_file():
             raise HTTPException(404, "no such file")
@@ -414,7 +489,7 @@ def create_app(project: str | None = None) -> FastAPI:
     return app
 
 
-def _run_meta(run_id: str, run: dict[str, Any] | None) -> dict[str, Any]:
+def _run_meta(run: dict[str, Any] | None) -> dict[str, Any]:
     if run is None:
         return {"status": "unknown", "detail": "", "current_step": None, "steps": {}}
     steps = run.get("steps", {})
@@ -442,14 +517,25 @@ def _registry_read(pdir: Path) -> dict[str, str]:
 
 
 def _registry_write(pdir: Path, run_id: str, sid: str) -> None:
-    try:
-        reg = _registry_read(pdir)
-        reg[run_id] = sid
-        # also allow lookup by session id directly
-        reg.setdefault(sid, sid)
-        _registry_path(pdir).write_text(json.dumps(reg))
-    except OSError:
-        pass
+    """Persist run_id -> session_id.
+
+    Three threads call this per run (worker publish, worker finish, monitor),
+    so the read-modify-write must be serialised and the replace atomic:
+    otherwise concurrent writers lose entries outright, and a reader can see
+    a half-written file (write_text truncates before writing).
+    """
+    with _REGISTRY_LOCK:
+        try:
+            reg = _registry_read(pdir)
+            reg[run_id] = sid
+            # also allow lookup by session id directly
+            reg.setdefault(sid, sid)
+            dst = _registry_path(pdir)
+            tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(reg))
+            os.replace(tmp, dst)  # atomic on POSIX and Windows
+        except OSError:
+            pass
 
 
 def _find_run_dir(pdir: Path, run_id: str) -> Path | None:
@@ -472,24 +558,46 @@ def _find_run_dir(pdir: Path, run_id: str) -> Path | None:
 
 
 def _monitor_wait_sid(run_id: str, pdir: Path, stop: threading.Event) -> None:
-    """Wait for the worker's session dir to appear, then monitor it."""
-    seen: set[str] = {d.name for d in (pdir / "runs").iterdir() if d.is_dir()}
+    """Wait for the worker's session dir to appear, then monitor it.
+
+    The worker registers the run_dir itself as soon as run_auto returns, so
+    prefer that; fall back to scanning for a new session dir only while the
+    worker is still running. Scanning alone is wrong when two runs are in
+    flight — it can attach this run's UI to the other run's directory.
+    """
     run_dir: Path | None = None
     for _ in range(600):  # up to ~5 min for spec expand on slow models
         if stop.is_set():
             return
-        current = {d.name for d in (pdir / "runs").iterdir() if d.is_dir()}
-        new = [n for n in current - seen
-               if "__i" not in n and (pdir / "runs" / n / "spec.json").exists()]
-        if new:
-            run_dir = pdir / "runs" / sorted(new)[-1]
-            break
+        with _RUNS_LOCK:
+            mapped = _RUNS.get(run_id, {}).get("run_dir")
+            worker_done = _RUNS.get(run_id, {}).get("finished", False)
+        if mapped:
+            p = Path(mapped)
+            if (p / "spec.json").exists():
+                run_dir = p
+                break
+        if worker_done:
+            break  # worker finished without a run dir (error path)
         time.sleep(0.5)
     if run_dir is None:
-        _emit(run_id, {"type": "error", "message": "session dir never appeared"})
+        sid = _registry_read(pdir).get(run_id)
+        if sid:
+            p = pdir / "runs" / sid
+            if (p / "spec.json").exists():
+                run_dir = p
+    if run_dir is None:
         with _RUNS_LOCK:
-            if run_id in _RUNS:
-                _RUNS[run_id]["done"] = True
+            already_done = _RUNS.get(run_id, {}).get("finished", False)
+        if not already_done:
+            # Report it, but do NOT set done: the worker is still running and
+            # owns that flag. Marking it done here makes every later _emit a
+            # no-op, so run_auto would finish invisibly.
+            _emit(run_id, {
+                "type": "error",
+                "message": "no session dir yet; run still in progress "
+                           "(progress will appear once DEFINE completes)",
+            })
         return
     with _RUNS_LOCK:
         if run_id in _RUNS:

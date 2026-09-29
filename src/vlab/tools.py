@@ -19,6 +19,7 @@ TOOL_SPECS: list[tuple[str, str, list[str], str]] = [
     ("Icarus Verilog", "iverilog", ["-V"], "simulation, VCD waveform"),
     ("VVP runtime", "vvp", ["-V"], "run iverilog output"),
     ("Verilator", "verilator", ["--version"], "alt simulator"),
+    ("make", "make", ["--version"], "verilator --binary needs it to build"),
     ("Yosys", "yosys", ["-V"], "synthesis + area (stat)"),
     ("ABC (yosys-abc)", "yosys-abc", ["-h"], "tech mapping via yosys"),
     ("OpenSTA", "sta", ["-v"], "timing + power from VCD"),
@@ -40,6 +41,14 @@ def check_tools() -> list[ToolStatus]:
         hint = ""
         if out.strip():
             hint = out.strip().splitlines()[0][:120]
+        # rc 126/127 means the binary exists but cannot be executed (missing
+        # shared library, bad permissions). Reporting that as "found" hides a
+        # broken toolchain until the flow fails deep inside a subprocess.
+        if rc in (126, 127):
+            results.append(ToolStatus(
+                display, binary, False,
+                hint or f"present but not runnable (rc={rc})", purpose))
+            continue
         if not hint:
             hint = path
         results.append(ToolStatus(display, binary, True, hint, purpose))

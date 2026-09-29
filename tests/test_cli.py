@@ -37,3 +37,28 @@ def test_new_gen_flow_offline(tmp_path):
     assert "Session:" in r.stdout
     r = runner.invoke(app, ["gen", "--project", str(tmp_path), "--no-llm"])
     assert r.exit_code == 0, r.stdout
+
+
+def test_every_command_help_works():
+    """A broken command signature is invisible until someone runs it."""
+    for cmd in ("init", "new", "gen", "simulate", "synth", "ppa", "report",
+                "fix", "run", "auto", "serve", "check-tools", "check-llm",
+                "models"):
+        r = runner.invoke(app, [cmd, "--help"])
+        assert r.exit_code == 0, f"{cmd}: {r.stdout}"
+
+
+def test_models_lists_rotation_order():
+    """Regression: --probe referenced get_api_key without importing it."""
+    r = runner.invoke(app, ["models"])
+    assert r.exit_code == 0, r.stdout
+    assert "primary" in r.stdout
+    assert "fallback" in r.stdout
+
+
+def test_models_probe_requires_no_import_error():
+    r = runner.invoke(app, ["models", "--probe"])
+    # either probes successfully, or fails cleanly with a message
+    assert r.exception is None or isinstance(r.exception, SystemExit), r.stdout
+    assert "NameError" not in r.stdout
+    assert "Traceback" not in r.stdout

@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import shutil
+import threading
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import runs_dir, session_dir
 from .optimize import (
     candidate_metrics,
     check_constraints,
     memory_append,
-    memory_read,
     pareto_frontier,
     pick_winner,
     search_guidance,
@@ -70,8 +72,35 @@ def review_spec(spec: dict[str, Any], use_llm: bool) -> tuple[dict[str, Any], li
         return spec, []
 
 
-def _sid(dut: str) -> str:
-    return f"{dut}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+# session ids claimed in this process, so two threads starting in the same
+# second cannot both pick the free one
+_SID_CLAIMED: set[str] = set()
+_SID_LOCK = threading.Lock()
+
+
+def _sid(dut: str, project_dir: Path | None = None) -> str:
+    """Claim a unique session id: <dut>_<timestamp>[_n].
+
+    Two-second resolution alone collides when two runs start in the same
+    second — which the web dashboard can do, since it runs them on parallel
+    threads. A collision makes both runs share one directory and overwrite
+    each other's spec/candidates. The check-and-claim happens under one lock
+    so two threads cannot both select the same free id.
+    """
+    base = f"{dut}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    with _SID_LOCK:
+        sid = base
+        n = 0
+        while sid in _SID_CLAIMED or (
+            project_dir is not None and (runs_dir(project_dir) / sid).exists()
+        ):
+            n += 1
+            if n > 50:  # pathological; use something certainly unique
+                sid = f"{base}_{uuid.uuid4().hex[:6]}"
+                break
+            sid = f"{base}_{n}"
+        _SID_CLAIMED.add(sid)
+        return sid
 
 
 CLARIFY_PROMPT = """You review a one-line RTL design request. If it lacks what an
@@ -127,15 +156,30 @@ def expand_spec(
             raise RuntimeError(
                 f"LLM spec expand parse failed. Raw head: {raw[:200]!r}"
             )
+        # A free-tier model can reply with a list, a bare string, or an object
+        # missing keys. Dereferencing before validating turned those into
+        # TypeError/KeyError, which escaped as a raw traceback.
+        if not isinstance(spec, dict):
+            raise RuntimeError(
+                f"LLM spec expand returned {type(spec).__name__}, not an object"
+            )
         if dut_hint:
             from .spec import validate_module_name
 
             spec["dut_name"] = validate_module_name(dut_hint)
+        spec.setdefault("description", prompt.strip()[:500] or "unspecified DUT")
+        spec.setdefault("ports", [])
+        spec.setdefault("features", [])
+        if not spec["ports"]:
+            raise RuntimeError(
+                "LLM spec expand returned no ports; cannot generate RTL. "
+                "Re-run, or pass --dut/--width and use `vlab new` instead."
+            )
         spec["data_width"] = width or spec.get("data_width", 8)
         spec.setdefault("suggested_candidates", 1)
         spec["pdk_choice"] = "auto"
-        feats = ", ".join(spec.get("features", []))
-        selected, reason = llm_pick_pdk(spec["description"], feats, "auto")
+        feats = ", ".join(str(f) for f in spec.get("features", []))
+        selected, reason = llm_pick_pdk(str(spec["description"]), feats, "auto")
     else:
         from .spec import default_spec
 
@@ -174,6 +218,18 @@ def _sim_passes(outdir: Path) -> tuple[str, int, int]:
         return "unknown", 0, 0
 
 
+def _norm(v: str) -> str:
+    """Whitespace/comment/directive-insensitive form for no-op repair detection.
+
+    sanitize_testbench always prepends a `timescale, so compiler directives
+    must be ignored or every TB repair would look like a change.
+    """
+    stripped = re.sub(r"//[^\n]*", "", v)
+    stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.S)
+    stripped = re.sub(r"^\s*`\w+[^\n]*$", "", stripped, flags=re.M)
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
 def _verify_candidate(
     project_dir: Path,
     cid: str,
@@ -186,8 +242,8 @@ def _verify_candidate(
         _extract_tb,
         _require_design_intact,
         design_repair_prompt,
-        is_compile_fail,
         repair_prompt,
+        repair_target,
         sanitize_testbench,
     )
     from .llm import chat as llm_chat
@@ -198,17 +254,25 @@ def _verify_candidate(
     dut = spec["dut_name"]
     repairs = 0
     last_err = ""
+    passes = fails = 0
     # freeze golden on first PASS (tb + pass count as anti-weakening bar)
     for _ in range(max_fix_rounds + 1):
         design = (outdir / "design.v").read_text()
         sim = run_simulate(project_dir, cid, tool="auto")
         status, passes, fails = sim["status"], sim["pass_count"], sim["fail_count"]
         if status == "pass":
+            tb_src = next(iter(sorted(outdir.glob("tb_*.v"))))
             if not golden.get("passes"):
-                tb_src = next(iter(sorted(outdir.glob("tb_*.v"))))
+                # first passing candidate defines the bar
                 shutil.copy(tb_src, outdir / f"golden_tb_{dut}.v")
                 golden.update({"passes": passes, "tb": str(tb_src)})
-            elif passes < golden["passes"]:
+            elif repairs and passes < golden["passes"]:
+                # Anti-weakening only applies to a candidate WE repaired.
+                # Comparing an independent candidate against the first
+                # candidate's check count just biased selection toward
+                # whichever design happened to be generated first — an
+                # untouched TB that legitimately has fewer checks is not a
+                # weakened one.
                 return {
                     "status": "fail", "passes": passes, "fails": fails,
                     "repairs": repairs,
@@ -220,10 +284,10 @@ def _verify_candidate(
         tb = next(iter(sorted(outdir.glob("tb_*.v")))).read_text()
         simlog = outdir / "sim.log"
         log = simlog.read_text() if simlog.exists() else "(no sim log)"
-        design_target = is_compile_fail(sim, log)
+        target = repair_target(sim, log)
         prompt = (
             design_repair_prompt(design, log, dut, spec.get("ports", []))
-            if design_target
+            if target == "design"
             else repair_prompt(design, tb, log, dut)
         )
         try:
@@ -239,20 +303,31 @@ def _verify_candidate(
             }
         (outdir / f"fix_r{repairs + 1}_raw.txt").write_text(raw)
         try:
-            if design_target:
+            if target == "design":
                 fixed = _extract_design(raw, dut)
                 _require_design_intact(fixed, dut, spec.get("ports", []))
-                (outdir / "design.v").write_text(fixed)
             else:
                 fixed, _ = sanitize_testbench(_extract_tb(raw, dut), dut)
-                (outdir / f"tb_{dut}.v").write_text(fixed)
         except ValueError as e:
             last_err = str(e)[:200]
             repairs += 1  # truncated/garbled output: count round, retry
             continue
+        # unchanged output means the model is not converging on this file;
+        # further identical rounds just burn rate-limit budget. Compare on
+        # normalized text: sanitize_testbench always prepends a `timescale.
+        if _norm(fixed) == _norm(design if target == "design" else tb):
+            return {"status": "fail", "passes": passes, "fails": fails,
+                    "repairs": repairs,
+                    "note": f"repair reproduced the {target} unchanged"}
+        if target == "design":
+            (outdir / "design.v").write_text(fixed)
+        else:
+            (outdir / f"tb_{dut}.v").write_text(fixed)
         repairs += 1
-    return {"status": "fail", "passes": 0, "fails": 0, "repairs": repairs,
-            "note": last_err}
+    # `passes`/`fails` are the live values from the last simulation; do not
+    # fabricate zeros here or auto.json records a result that never happened
+    return {"status": "fail", "passes": passes, "fails": fails,
+            "repairs": repairs, "note": last_err}
 
 
 def run_auto(
@@ -265,12 +340,21 @@ def run_auto(
     max_fix_rounds: int = 3,
     use_llm: bool = True,
     freq_mhz: float = 100.0,
+    on_session: Callable[[Path], None] | None = None,
 ) -> dict[str, Any]:
-    """Full autonomous loop. width/candidates None = decided by the LLM."""
+    """Full autonomous loop. width/candidates None = decided by the LLM.
+
+    on_session, when given, is called with the run dir as soon as the
+    session id exists (before any candidate work starts).
+    """
     from .ppa import run_ppa
     from .report import build_report
     from .rtl_gen import run_gen
     from .synth import run_synth
+
+    # EDA tools run with cwd=<run dir>, so every path handed to them must be
+    # absolute; a relative project_dir would resolve against the wrong root
+    project_dir = Path(project_dir).resolve()
 
     if candidates is not None and candidates < 1:
         raise ValueError("candidates must be >= 1")
@@ -289,13 +373,20 @@ def run_auto(
         candidates = 1
     candidates = max(1, min(8, candidates))
     spec["data_width"] = width
-    sid = _sid(spec["dut_name"])
+    sid = _sid(spec["dut_name"], project_dir)
     rdir = runs_dir(project_dir) / sid
     rdir.mkdir(parents=True, exist_ok=True)
     (rdir / "spec.json").write_text(json.dumps(spec, indent=2))
     sdir = project_dir / "sessions" / sid
     sdir.mkdir(parents=True, exist_ok=True)
     (sdir / "spec.json").write_text(json.dumps(spec, indent=2))
+    # publish the session id as soon as it exists so live UIs can attach
+    # to this run without guessing from a directory scan
+    if on_session is not None:
+        try:
+            on_session(rdir)
+        except Exception:  # noqa: BLE001 - a UI hook must never break the run
+            pass
     mem = rdir / "memory.jsonl"
     golden: dict[str, Any] = {}
     guidance = ""
@@ -327,14 +418,17 @@ def run_auto(
                     m = candidate_metrics("pass", syn["area"], ppa["timing"], ppa["power"])
                     entry.update(m)
                     entry["constraints"] = check_constraints(m, spec.get("limits", {}))
-                except (RuntimeError, FileNotFoundError) as e:
+                except Exception as e:  # noqa: BLE001 - one candidate's PPA
+                    # must not abort measurement for the others
                     entry["status"] = "error"
-                    entry["note"] = str(e)[:200]
+                    entry["note"] = f"{type(e).__name__}: {e}"[:200]
             all_cands.append(entry)
             memory_append(mem, {"sid": sid, **entry})
-        front = pareto_frontier(all_cands)
         if it < iterations:
-            guidance = search_guidance(spec, memory_read(mem), front, all_cands)
+            # only needed to steer the next generation
+            guidance = search_guidance(
+                spec, pareto_frontier(all_cands), all_cands
+            )
 
     winner = pick_winner(all_cands)
     final_dir = None

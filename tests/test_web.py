@@ -77,6 +77,41 @@ def test_state_reports_issues_and_meta(tmp_path):
     assert c0["warnings"] == ["no VCD"]
 
 
+def test_run_file_rejects_sibling_prefix_escape(tmp_path):
+    """A sibling dir whose name starts with 'runs' must not be readable."""
+    c = _app(tmp_path)
+    (tmp_path / "runs_evil").mkdir(exist_ok=True)
+    (tmp_path / "runs_evil" / "secret.txt").write_text("top secret")
+    r = c.get("/api/runs/r1/files/../runs_evil/secret.txt")
+    assert r.status_code in (404, 400)
+    assert "top secret" not in r.text
+
+
+def test_file_serving_handles_backslash_and_dotdot(tmp_path):
+    c = _app(tmp_path)
+    for bad in ("..%2Fspec.json", "..\\spec.json", "a/../../spec.json"):
+        r = c.get(f"/api/runs/r1/files/{bad}")
+        assert r.status_code in (404, 400), bad
+
+
+def test_monitor_binds_to_worker_run_dir_not_a_concurrent_one(tmp_path):
+    """Two runs in flight must not cross-wire their monitors."""
+    from vlab import web as web_mod
+
+    proj = tmp_path / "proj"
+    (proj / "runs" / "mine").mkdir(parents=True)
+    (proj / "runs" / "mine" / "spec.json").write_text("{}")
+    (proj / "runs" / "theirs").mkdir(parents=True)
+    (proj / "runs" / "theirs" / "spec.json").write_text("{}")
+    web_mod._registry_write(proj, "runA", "mine")
+    web_mod._registry_write(proj, "runB", "theirs")
+    web_mod._RUNS.clear()
+    c = TestClient(create_app(str(proj)))
+    a = c.get("/api/runs/runA/files").json()["files"]
+    b = c.get("/api/runs/runB/files").json()["files"]
+    assert "spec.json" in a and "spec.json" in b
+
+
 def test_registry_survives_restart_and_listing(tmp_path):
     import json as _json
 

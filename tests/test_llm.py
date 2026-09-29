@@ -156,11 +156,21 @@ def test_reasoning_params_default_and_off(monkeypatch):
     monkeypatch.delenv("VLAB_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("VLAB_REASONING_MAX_TOKENS", raising=False)
     p = llm_mod._reasoning_params()
-    assert p == {"reasoning": {"effort": "low", "max_tokens": 512}}
+    # OpenRouter 400s when effort and max_tokens are BOTH present, so the
+    # default must send exactly one.
+    assert p == {"reasoning": {"effort": "low"}}
     monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
     assert llm_mod._reasoning_params() is None
     monkeypatch.setenv("VLAB_REASONING_EFFORT", "exclude")
     assert llm_mod._reasoning_params() == {"reasoning": {"exclude": True}}
+    # token-budget mode is opt-in and sends max_tokens alone
+    monkeypatch.setenv("VLAB_REASONING_EFFORT", "tokens")
+    monkeypatch.setenv("VLAB_REASONING_MAX_TOKENS", "256")
+    assert llm_mod._reasoning_params() == {"reasoning": {"max_tokens": 256}}
+    for effort in ("low", "medium", "high"):
+        monkeypatch.setenv("VLAB_REASONING_EFFORT", effort)
+        r = llm_mod._reasoning_params()["reasoning"]
+        assert set(r) == {"effort"}, f"{effort} must send effort only"
 
 
 def test_chat_passes_reasoning_and_falls_back(monkeypatch):
@@ -184,5 +194,77 @@ def test_chat_passes_reasoning_and_falls_back(monkeypatch):
     monkeypatch.delenv("VLAB_REASONING_EFFORT", raising=False)
     monkeypatch.setitem(sys.modules, "openai", mod)
     assert llm_mod.chat([{"role": "user", "content": "hi"}], retries=0) == "ok"
-    assert seen[0].get("extra_body") == {"reasoning": {"effort": "low", "max_tokens": 512}}
+    assert seen[0].get("extra_body") == {"reasoning": {"effort": "low"}}
     assert "extra_body" not in seen[1]  # fallback went bare
+
+
+def test_chat_rotates_models_on_429(monkeypatch):
+    """A rate-limited model must not end the run: rotate to the next one."""
+    import vlab.llm as llm_mod
+
+    used, sleeps = [], []
+
+    class Rotating:
+        def create(self, **kw):
+            model = kw["model"]
+            used.append(model)
+            if model == "primary/model:free":
+                raise RuntimeError("429 poolside/model is temporarily rate-limited")
+            msg = types.SimpleNamespace(content="ok-from-backup")
+            return types.SimpleNamespace(choices=[
+                types.SimpleNamespace(message=msg, finish_reason="stop")])
+
+    mod = types.ModuleType("openai")
+    mod.OpenAI = lambda **kw: types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=Rotating()))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("OPENROUTER_MODEL", "primary/model:free")
+    monkeypatch.setenv("VLAB_LLM_FALLBACKS", "backup/a:free,backup/b:free")
+    monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
+    monkeypatch.setitem(sys.modules, "openai", mod)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    assert llm_mod.chat([{"role": "user", "content": "hi"}], retries=0) == \
+        "ok-from-backup"
+    assert used == ["primary/model:free", "backup/a:free"]
+
+
+def test_chat_does_not_rotate_on_auth_or_quota(monkeypatch):
+    """401/402 are key-level: the error must surface, not be masked by rotation."""
+    import vlab.llm as llm_mod
+
+    class Boom:
+        def create(self, **kw):
+            raise RuntimeError("402 insufficient credits on this key")
+
+    mod = types.ModuleType("openai")
+    mod.OpenAI = lambda **kw: types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=Boom()))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("VLAB_LLM_FALLBACKS", "backup/a:free")
+    monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
+    monkeypatch.setitem(sys.modules, "openai", mod)
+    with pytest.raises(RuntimeError) as ei:
+        llm_mod.chat([{"role": "user", "content": "hi"}], retries=0)
+    # the real cause is preserved in the message for the user to act on
+    assert "insufficient credits" in str(ei.value)
+
+
+def test_fallbacks_can_be_disabled(monkeypatch):
+    import vlab.llm as llm_mod
+
+    monkeypatch.setenv("VLAB_LLM_FALLBACKS", "")
+    assert llm_mod.fallback_models() == []
+    assert not llm_mod._fallbacks_enabled()
+    monkeypatch.setenv("VLAB_LLM_FALLBACKS", "a:free, b:free ,")
+    assert llm_mod.fallback_models() == ["a:free", "b:free"]
+
+
+def test_is_model_scoped_error():
+    import vlab.llm as llm_mod
+
+    assert llm_mod._is_model_scoped_error("Error code: 429 - rate limited")
+    assert llm_mod._is_model_scoped_error("503 no endpoints available")
+    assert not llm_mod._is_model_scoped_error("401 invalid api key")
+    assert not llm_mod._is_model_scoped_error("402 insufficient credits")
+    assert not llm_mod._is_model_scoped_error("400 bad request")

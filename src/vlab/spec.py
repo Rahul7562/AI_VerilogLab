@@ -6,18 +6,6 @@ from typing import Any
 
 from .config import DEFAULT_PDK_CHOICE, SUPPORTED_PDKS
 
-SPEC_REQUIRED_KEYS = (
-    "dut_name",
-    "description",
-    "category",
-    "data_width",
-    "pdk_choice",
-    "pdk_selected",
-    "ports",
-    "features",
-    "test_plan",
-)
-
 _MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
@@ -76,10 +64,15 @@ def llm_pick_pdk(description: str, features: str, pdk_choice: str) -> tuple[str,
             temperature=0.0,
         )
         low = out.lower()
-        for pdk in SUPPORTED_PDKS:
-            if pdk in low:
-                reason = out.strip().splitlines()[0][:200]
-                return pdk, f"llm: {reason}"
+        # Order by where the model MENTIONED the PDK, not by registry order:
+        # "nangate45 : better than sky130" must pick nangate45, but scanning
+        # SUPPORTED_PDKS in order returned sky130 — and the PDK chooses the
+        # liberty behind every reported area/timing/power number.
+        hits = [(low.find(p), p) for p in SUPPORTED_PDKS if p in low]
+        if hits:
+            pdk = min(hits)[1]
+            reason = out.strip().splitlines()[0][:200]
+            return pdk, f"llm: {reason}"
     except Exception:
         pass
     return heuristic_pdk(description, features)
@@ -117,11 +110,35 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     spec["pdk_choice"] = validate_pdk_choice(str(spec.get("pdk_choice", "auto")))
     if not isinstance(spec.get("ports"), list) or not spec["ports"]:
         raise ValueError("spec.ports must be a non-empty list")
+    # Validate port names/widths here rather than at render time: a spec can
+    # also arrive from review_spec or an edited spec.json, and a name like
+    # "data[7:0]" or "1bad" produces Verilog that cannot compile.
+    seen: set[str] = set()
     for p in spec["ports"]:
         if not isinstance(p, dict) or "name" not in p or "direction" not in p:
             raise ValueError(f"bad port entry: {p!r}")
         if p["direction"] not in ("input", "output", "inout"):
             raise ValueError(f"bad port direction: {p!r}")
+        name = str(p["name"])
+        if not _MODULE_RE.match(name):
+            raise ValueError(
+                f"invalid Verilog port name {name!r}: "
+                "use [A-Za-z_][A-Za-z0-9_$]* with no bus range "
+                "(declare width via the 'width' field)"
+            )
+        if name in seen:
+            raise ValueError(f"duplicate port name {name!r}")
+        seen.add(name)
+        if "width" in p:
+            try:
+                w = int(p["width"])
+            except (TypeError, ValueError):
+                raise ValueError(f"port {name!r} width must be an int") from None
+            if w < 1:
+                raise ValueError(f"port {name!r} width must be >= 1, got {w}")
+            p["width"] = w
+        else:
+            p["width"] = 1
     try:
         spec["data_width"] = int(spec.get("data_width", 8))
     except (TypeError, ValueError):

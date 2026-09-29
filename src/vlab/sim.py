@@ -13,12 +13,23 @@ from .utils import run_logged
 def _find_rtl(outdir: Path, dut: str) -> tuple[Path, Path]:
     design = outdir / "design.v"
     tb = outdir / f"tb_{dut}.v"
+    vfiles = sorted(outdir.glob("*.v"))
     if not design.exists():
-        cands = list(outdir.glob("*.v"))
+        # Only a file that actually declares `module <dut>` can be the DUT;
+        # alphabetical order otherwise picks a stray .v, and golden_tb_* is
+        # a frozen copy that must never be synthesised or simulated as RTL.
+        cands = [
+            p for p in vfiles
+            if not p.name.startswith("golden_tb_")
+            and p.name != f"tb_{dut}.v"
+            and re.search(rf"\bmodule\s+{re.escape(dut)}\b",
+                          p.read_text(errors="ignore")[:4000])
+        ]
         if cands:
             design = cands[0]
     if not tb.exists():
-        cands = [p for p in outdir.glob("*.v") if p != design]
+        cands = [p for p in vfiles if p != design
+                 and p.name.startswith("tb_")]
         if cands:
             tb = cands[0]
     if not design.exists() or not tb.exists():
@@ -26,16 +37,45 @@ def _find_rtl(outdir: Path, dut: str) -> tuple[Path, Path]:
     return design, tb
 
 
+def _clear_stale(outdir: Path) -> None:
+    """Remove artifacts from a previous run.
+
+    A leftover wave.vcd from an earlier passing simulation would otherwise be
+    reported for a run that just failed, feeding wrong switching activity into
+    the power estimate.
+    """
+    for name in ("wave.vcd", "sim.vvp"):
+        p = outdir / name
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _parse_result(log: str, rc: int = 0) -> dict[str, Any]:
     passes = len(re.findall(r"PASS[:\s]", log))
-    fails = len(re.findall(r"FAIL[:\s]|ERROR[:\s]|ASSERT", log))
+    # Anchor to a display-like line so prose such as "Note: PASS/FAIL summary
+    # below" or an echoed command line is not scored as a failing check.
+    fails = len(re.findall(r"(?m)^\s*(?:[^:\n]*:\s*)*FAIL\b", log))
+    fails += len(re.findall(r"ERROR[:\s]|ASSERT", log))
     # $fatal / assertion failures
     if re.search(r"FATAL|\\$fatal", log):
         fails += 1
-    # any nonzero tool rc or missing $finish output is a failure
-    ok = rc == 0 and fails == 0 and ("PASS" in log or "DONE" in log or "finish" in log.lower())
+    finished = re.search(r"\$finish|finish called", log, re.I) is not None
+    # A run is only a pass if it terminated, had no failing checks, AND
+    # actually asserted something. Without the last condition a testbench
+    # that compiles, runs and $finishes with zero checks would be reported
+    # as a pass with 0 passes — a silent false positive that lets an
+    # unverified DUT win selection.
+    ran = "PASS" in log or "DONE" in log or finished
+    ok = rc == 0 and fails == 0 and ran and (passes > 0 or fails > 0)
     status = "pass" if ok else "fail"
-    return {"pass_count": passes, "fail_count": fails, "status": status}
+    out: dict[str, Any] = {
+        "pass_count": passes, "fail_count": fails, "status": status,
+    }
+    if rc == 0 and passes == 0 and fails == 0:
+        out["note"] = "testbench made no assertions (0 PASS, 0 FAIL)"
+    return out
 
 
 def _iverilog_base_args(iv: str) -> list[str]:
@@ -69,6 +109,7 @@ def run_iverilog(outdir: Path, design: Path, tb: Path, timeout: int = 120) -> di
     if not iv or not vvp:
         raise RuntimeError("iverilog/vvp not found. Install iverilog or set VLAB_IVERILOG_BIN.")
     vvp_out = outdir / "sim.vvp"
+    _clear_stale(outdir)
     env = tool_env()
     base_args = _iverilog_base_args(iv)
     rc1, log1 = run_logged([iv, *base_args, "-g2012", "-o", str(vvp_out), str(design), str(tb)], cwd=outdir, timeout=timeout, extra_env=env)
@@ -96,11 +137,28 @@ def run_verilator(outdir: Path, design: Path, tb: Path, timeout: int = 180) -> d
     ver = resolve_tool("verilator")
     if not ver:
         raise RuntimeError("verilator not found. Install verilator or set VLAB_VERILATOR_BIN.")
+    # verilator --binary shells out to make + a C++ compiler; without them it
+    # fails deep inside with an opaque rc=127 instead of saying what's missing
+    if resolve_tool("make") is None:
+        raise RuntimeError(
+            "verilator --binary requires `make` (and a C++ compiler) to build the "
+            "testbench executable. Install build-essential, or use --tool iverilog."
+        )
     env = tool_env()
-    # --binary builds a model executable; needs --top-module tb
+    _clear_stale(outdir)
+    # --binary builds a model executable; needs --top-module tb.
+    # --trace is required for $dumpfile/$dumpvars to emit a VCD — without it
+    # the whole PPA power path (which needs wave.vcd) silently degrades.
     tb_top = tb.stem
     exe = outdir / f"V{tb_top}"
-    cmd = [ver, "--binary", "-j", "0", "--top-module", tb_top, "-o", str(exe), str(design), str(tb)]
+    cmd = [
+        ver, "--binary", "-j", "0", "--trace", "--trace-structs",
+        # Verilator exits nonzero on any warning by default; lint noise
+        # (missing timescale, unused bits) must not fail the simulation.
+        "-Wno-fatal", "-Wno-TIMESCALEMOD", "-Wno-WIDTH", "-Wno-UNUSED",
+        "-Wno-DECLFILENAME", "-Wno-EOFNEWLINE",
+        "--top-module", tb_top, "-o", str(exe), str(design), str(tb),
+    ]
     rc1, log1 = run_logged(cmd, cwd=outdir, timeout=timeout, extra_env=env)
     log = f"$ {' '.join(cmd)} rc={rc1}\n{log1}\n"
     rc = rc1
@@ -110,13 +168,16 @@ def run_verilator(outdir: Path, design: Path, tb: Path, timeout: int = 180) -> d
         rc = rc2
     (outdir / "sim.log").write_text(log)
     vcd = outdir / "wave.vcd"
-    # verilator needs --trace to dump VCD; warn if missing
     parsed = _parse_result(log, rc)
     if vcd.exists():
         parsed["vcd"] = str(vcd)
+        parsed["vcd_bytes"] = vcd.stat().st_size
     else:
         parsed["vcd"] = None
-        log += "NOTE: no wave.vcd (verilator needs --trace in flow; prefer iverilog for VCD).\n"
+        log += (
+            "NOTE: no wave.vcd produced. Verilator only dumps a trace when the "
+            "testbench calls $dumpfile/$dumpvars.\n"
+        )
         (outdir / "sim.log").write_text(log)
     return {"tool": "verilator", "rc": rc, "log": str(outdir / "sim.log"), **parsed}
 
@@ -127,6 +188,9 @@ def run_simulate(
     tool: str = "auto",
     timeout: int = 120,
 ) -> dict[str, Any]:
+    # iverilog/vvp/verilator run with cwd=outdir, so the design and testbench
+    # paths handed to them must be absolute
+    project_dir = Path(project_dir).resolve()
     outdir = session_dir(project_dir, session_id)
     spec_p = outdir / "spec.json"
     if not spec_p.exists():

@@ -7,22 +7,41 @@ from pathlib import Path
 from typing import Any
 
 
+def _module_span(text: str, name: str) -> str | None:
+    """Slice `module <name>` .. `endmodule`.
+
+    The name is matched with a word boundary: a plain `find("module cnt")`
+    also matches `module cnt_sub`, so a reply containing a submodule first
+    had the submodule extracted as the DUT.
+    """
+    m = re.search(rf"\bmodule\s+{re.escape(name)}\b", text)
+    if not m:
+        return None
+    end = text.find("endmodule", m.start())
+    if end < 0:
+        return None
+    return text[m.start(): end + len("endmodule")].strip()
+
+
 def _extract_tb(text: str, dut: str) -> str:
     """Robust testbench extraction: fences first, then tb module slice."""
     blocks = re.findall(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", text, re.S)
-    cands = [b.strip() for b in blocks if f"tb_{dut}" in b]
-    if cands:
-        return max(cands, key=len)
-    if blocks:  # fence without module name match — take largest plausible
+    name = f"tb_{dut}"
+    for b in sorted(blocks, key=len, reverse=True):
+        # slice even inside a fence: a fence can hold a helper submodule
+        # before the real testbench, and returning the whole block would
+        # hand two modules to a testbench file
+        sliced = _module_span(b, name)
+        if sliced:
+            return sliced
+    if blocks:  # fence without a matching module — take largest plausible
         big = max(blocks, key=len)
         if "module" in big and "$finish" in big:
             return big.strip()
     # raw Verilog without fences: slice tb module..endmodule
-    start = text.find(f"module tb_{dut}")
-    if start >= 0:
-        end = text.find("endmodule", start)
-        if end > start:
-            return text[start : end + len("endmodule")].strip()
+    sliced = _module_span(text, name)
+    if sliced:
+        return sliced
     raise ValueError("No testbench found in LLM output")
 
 
@@ -65,10 +84,8 @@ def design_repair_prompt(
 
 def _extract_design(text: str, dut: str) -> str:
     """Extract `module <dut>..endmodule` from fences or raw text."""
-    import re as _re
-
-    blocks = _re.findall(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", text, re.S)
-    cands = [b.strip() for b in blocks if f"module {dut}" in b]
+    blocks = re.findall(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", text, re.S)
+    cands = [b.strip() for b in blocks if re.search(rf"\bmodule\s+{re.escape(dut)}\b", b)]
     if cands:
         return _slice_module(max(cands, key=len), dut)
     if blocks:
@@ -78,18 +95,17 @@ def _extract_design(text: str, dut: str) -> str:
                     return _slice_module(b, dut)
                 except ValueError:
                     continue
-    start = text.find(f"module {dut}")
-    if start >= 0:
-        return _slice_module(text[start:], dut)
+    sliced = _module_span(text, dut)
+    if sliced:
+        return sliced
     raise ValueError("No fixed design found in LLM output")
 
 
 def _slice_module(text: str, dut: str) -> str:
-    start = text.find(f"module {dut}")
-    end = text.find("endmodule", start)
-    if start < 0 or end < 0:
+    sliced = _module_span(text, dut)
+    if not sliced:
         raise ValueError(f"module {dut}..endmodule not found")
-    return text[start : end + len("endmodule")].strip()
+    return sliced
 
 
 def sanitize_testbench(tb: str, dut: str) -> tuple[str, list[str]]:
@@ -113,35 +129,71 @@ def sanitize_testbench(tb: str, dut: str) -> tuple[str, list[str]]:
         out = "`timescale 1ns/1ps\n" + "\n".join(kept).lstrip("\n")
         if tb.endswith("\n"):
             out += "\n"
-    if f"module tb_{dut}" not in out:
+    if not re.search(rf"\bmodule\s+tb_{re.escape(dut)}\b", out):
         raise ValueError(f"sanitized TB names wrong module (want tb_{dut})")
     if "$finish" not in out:
         raise ValueError("sanitized TB missing $finish (would hang the simulator)")
     return out, warns
 
 
+def compile_error_file(log: str, design_name: str = "design.v") -> str | None:
+    """Which file does the compiler blame? "design", "testbench", or None.
+
+    iverilog prints `<path>:<line>: error: ...`. A testbench bug (assigning to
+    a DUT output declared `wire`, wrong module name, bad port connection) looks
+    identical to a design bug at the rc level, but repairing the wrong file
+    cannot ever converge — the LLM dutifully re-emits the unchanged DUT.
+    """
+    # every file the compiler referenced in a `<file>:<line>:` position
+    blamed: set[str] = {
+        Path(m.group(1)).name
+        for m in re.finditer(r"^\s*(\S+\.v(?:erilog)?):\d+:", log, re.M)
+    }
+    if not blamed:
+        return None
+    # a design error breaks elaboration of the TB too, so blame the design
+    if design_name in blamed or "design.v" in blamed:
+        return "design"
+    tb_like = {n for n in blamed if n.startswith("tb_") or n.lower().startswith("tb")}
+    if tb_like:
+        return "testbench"
+    # a single unknown .v file is the DUT: our pipeline only ever writes
+    # design.v plus tb_<dut>.v, and a stray third file would be the DUT copy
+    if len(blamed) == 1:
+        return "design"
+    return None
+
+
 def is_compile_fail(sim: dict, log: str) -> bool:
-    """True when simulation never ran (compile errors) — repair the DUT."""
+    """True when simulation never ran (compile errors) — repair needed."""
     if sim.get("rc", 0) != 0 and "PASS" not in log and "FAIL" not in log:
         return True
     return "syntax error" in log or "Incomprehensible" in log
-    return (
-        f"Output ONLY a Verilog testbench in one verilog code fence, no prose, "
-        f"no analysis — the code fence must be the first thing in your reply.\n"
-        f"Fix this failing iverilog testbench for DUT {dut} (keep module tb_{dut}, "
-        f"`timescale 1ns/1ps, $dumpfile(\"wave.vcd\"), $dumpvars(0,tb_{dut}), $finish).\n"
-        f"Rules: drive stimulus ONLY at negedge clk; sample outputs with #1 after "
-        f"posedge; separate clock block (initial clk=0; always #5 clk=~clk;); "
-        f"ONE stimulus+check initial block; >=5 PASS/FAIL $displays. "
-        f"Watch for off-by-one cycle counting: when checking a value N cycles "
-        f"after an event, count from the first edge where the DUT samples it.\n"
-        f"When a check samples the wrong STATE (not X), suspect your wait counts "
-        f"vs the DUT's counter/parameter semantics and align waits to the DUT's "
-        f"declared parameters.\n"
-        f"DUT:\n```verilog\n{design}\n```\n"
-        f"Failing testbench:\n```verilog\n{tb}\n```\n"
-        f"Sim log:\n```\n{log[:4000]}\n```"
-    )
+
+
+def repair_target(sim: dict, log: str, design_name: str = "design.v") -> str:
+    """Which file to hand back to the LLM: "design" or "testbench"."""
+    if not is_compile_fail(sim, log):
+        return "testbench"  # ran but asserted wrong -> TB expectations
+    blamed = compile_error_file(log, design_name)
+    if blamed is None:
+        # no file attribution: a pure elaboration/compile error with no
+        # parseable path is far more often a DUT elaboration problem
+        return "design" if "syntax error" in log or "Incomprehensible" in log \
+            else "testbench"
+    return blamed
+
+
+def _norm(v: str) -> str:
+    """Whitespace/comment/directive-insensitive form for no-op repair detection.
+
+    sanitize_testbench always prepends a `timescale, so directives have to be
+    ignored or every TB repair would look like a change.
+    """
+    stripped = re.sub(r"//[^\n]*", "", v)
+    stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.S)
+    stripped = re.sub(r"^\s*`\w+[^\n]*$", "", stripped, flags=re.M)
+    return re.sub(r"\s+", " ", stripped).strip()
 
 
 def run_fix(
@@ -178,11 +230,11 @@ def run_fix(
         if sim["status"] == "pass":
             break
         log = (outdir / "sim.log").read_text()
-        if is_compile_fail(sim, log):
-            entry["target"] = "design"
+        target = repair_target(sim, log)
+        entry["target"] = target
+        if target == "design":
             prompt = design_repair_prompt(design, log, dut, spec.get("ports", []))
         else:
-            entry["target"] = "testbench"
             prompt = repair_prompt(design, tb, log, dut)
         try:
             raw = llm_chat(
@@ -196,26 +248,48 @@ def run_fix(
             break
         (outdir / f"fix_r{rnd}_raw.txt").write_text(raw)
         try:
-            if entry["target"] == "design":
+            if target == "design":
                 fixed = _extract_design(raw, dut)
                 _require_design_intact(fixed, dut, spec.get("ports", []))
-                (outdir / "design.v").write_text(fixed)
             else:
                 fixed, san_warns = sanitize_testbench(_extract_tb(raw, dut), dut)
                 if san_warns:
                     entry["note"] = "; ".join(san_warns)
-                (outdir / f"tb_{dut}.v").write_text(fixed)
         except ValueError as e:
             entry["note"] = str(e)[:200]
             continue
+        # a repair that reproduces the file cannot converge; burning the
+        # remaining rounds on it is pure waste. Compare normalized text:
+        # sanitize_testbench always prepends a `timescale.
+        prev = design if target == "design" else tb
+        if _norm(fixed) == _norm(prev):
+            entry["note"] = f"repair reproduced the {target} unchanged"
+            break
+        if target == "design":
+            (outdir / "design.v").write_text(fixed)
+        else:
+            (outdir / f"tb_{dut}.v").write_text(fixed)
         entry["repaired_bytes"] = len(fixed)
     return {"session": session_id, "dut": dut, "rounds": history, "final": last_status}
 
 
 def _require_design_intact(design: str, dut: str, ports: list[dict]) -> None:
-    """Reject DUT repairs that rename the module or drop ports."""
-    if f"module {dut}" not in design:
+    """Reject DUT repairs that rename the module or drop/rename ports.
+
+    Uses the same header-aware port check as rtl_gen._require_ports: a plain
+    substring test accepted a design declaring only `a_reg` for spec port
+    `a`, so a repair could break the interface and still be written out.
+    """
+    from .rtl_gen import module_ports
+
+    if not re.search(rf"\bmodule\s+{re.escape(dut)}\b", design):
         raise ValueError("repair renamed the DUT module")
-    missing = [p["name"] for p in ports if p["name"] not in design]
+    names = [str(p["name"]) for p in ports]
+    if not names:
+        return
+    declared = module_ports(design, dut)
+    if declared is None:
+        raise ValueError("repair produced an unparsable module header")
+    missing = [n for n in names if n not in declared]
     if missing:
         raise ValueError(f"repair dropped ports: {missing}")

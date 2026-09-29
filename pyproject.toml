@@ -24,6 +24,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vlab"]
+# generic.lib is required by synth (abc mapping) and PPA (openSTA). Without
+# it in the wheel, an installed `vlab` silently degrades to unmapped
+# synthesis and "no timing" reports.
+artifacts = ["src/vlab/pdks/*.lib", "src/vlab/pdks/*.yaml"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"pdks" = "vlab/pdks"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

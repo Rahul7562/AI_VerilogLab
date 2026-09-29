@@ -45,6 +45,66 @@ def test_find_spec_ignores_auto_candidates(tmp_path):
     assert sid == "alu8_20250101_000000"
 
 
+def test_golden_bar_only_applies_to_repaired_candidates(tmp_path, monkeypatch):
+    """An independent candidate must not be rejected for having fewer checks.
+
+    The golden pass count was global, so whichever candidate was generated
+    first set the floor and every later candidate below it was discarded with
+    a "repair weakened TB" note it did not earn — biasing selection toward
+    candidate #1 instead of toward the best RTL.
+    """
+    import vlab.auto as auto_mod
+    import vlab.sim as sim_mod
+
+    proj = _mk_fix_session(tmp_path)
+    sims = [
+        {"status": "pass", "pass_count": 12, "fail_count": 0},  # candidate 1
+        {"status": "pass", "pass_count": 5, "fail_count": 0},   # candidate 2, 0 repairs
+    ]
+
+    def fake_sim(*a, **k):
+        (proj / "runs" / "s1" / "sim.log").write_text("PASS: ok\nDONE\n")
+        return sims.pop(0)
+
+    monkeypatch.setattr(sim_mod, "run_simulate", fake_sim)
+    golden = {}
+    first = auto_mod._verify_candidate(proj, "s1", 0, golden)
+    assert first["status"] == "pass" and first["passes"] == 12
+    assert golden["passes"] == 12
+    # second, unrepaired candidate with fewer checks is still a pass
+    second = auto_mod._verify_candidate(proj, "s1", 0, golden)
+    assert second["status"] == "pass", second
+    assert second["passes"] == 5
+
+
+def test_golden_bar_still_catches_a_weakened_repair(tmp_path, monkeypatch):
+    """The anti-weakening guard must still fire for a repaired candidate."""
+    import vlab.auto as auto_mod
+    import vlab.llm as llm_mod
+    import vlab.sim as sim_mod
+
+    proj = _mk_fix_session(tmp_path)
+    sims = [
+        {"status": "fail", "pass_count": 0, "fail_count": 1, "rc": 0},
+        {"status": "pass", "pass_count": 3, "fail_count": 0, "rc": 0},
+    ]
+
+    def fake_sim(*a, **k):
+        (proj / "runs" / "s1" / "sim.log").write_text("FAIL: nope\nDONE\n")
+        return sims.pop(0)
+
+    monkeypatch.setattr(sim_mod, "run_simulate", fake_sim)
+    # a repair that actually changes the TB (so the no-op guard does not trip)
+    monkeypatch.setattr(
+        llm_mod, "chat",
+        lambda *a, **k: "```verilog\nmodule tb_dut1; reg a; $finish; "
+                        "$display(\"PASS: fixed\"); endmodule\n```",
+    )
+    out = auto_mod._verify_candidate(proj, "s1", 1, {"passes": 9})
+    assert out["status"] == "fail"
+    assert "weakened" in out["note"]
+
+
 def test_verify_survives_garbled_llm(tmp_path, monkeypatch):
     import vlab.auto as auto_mod
     import vlab.llm as llm_mod
@@ -64,6 +124,39 @@ def test_verify_survives_garbled_llm(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_mod, "chat", lambda *a, **k: "truncated prose, no verilog")
     out = auto_mod._verify_candidate(tmp_path, sid, 1, {})
     assert out["status"] == "fail"  # must not raise
+
+
+def test_session_ids_never_collide_across_threads():
+    """The web dashboard runs jobs on parallel threads; two runs starting in
+    the same second used to share a runs/<sid> directory and clobber each
+    other's spec.json and candidates."""
+    import threading
+
+    from vlab.auto import _sid
+
+    out: list[str] = []
+    lock = threading.Lock()
+
+    def grab() -> None:
+        s = _sid("d")
+        with lock:
+            out.append(s)
+
+    ts = [threading.Thread(target=grab) for _ in range(25)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(out) == 25
+    assert len(set(out)) == 25, f"session id collision: {len(out) - len(set(out))}"
+
+
+def test_session_id_avoids_existing_dir(tmp_path):
+    from vlab.auto import _sid
+
+    (tmp_path / "runs" / "d_20200101_000000").mkdir(parents=True)
+    sid = _sid("d_20200101_000000", tmp_path)
+    assert sid != "d_20200101_000000"
 
 
 def test_auto_survives_candidate_error(tmp_path, monkeypatch):
@@ -115,6 +208,65 @@ def test_is_compile_fail():
     assert not is_compile_fail({"rc": 0}, "PASS: x")
 
 
+def test_compile_error_attribution():
+    """A compile error must be blamed on the file the compiler actually named.
+
+    Regression: a testbench assigning to a DUT output declared `wire` is a
+    TESTBENCH bug, but the old rc-only check routed repair to the design, so
+    the LLM re-emitted the unchanged DUT every round and the run died.
+    """
+    from vlab.fix import compile_error_file
+
+    tb_bug = (
+        "/p/tb_cnt8.v:82: error: count is not a valid l-value in tb_cnt8.\n"
+        "/p/tb_cnt8.v:8:      : count is declared here as wire.\n"
+    )
+    assert compile_error_file(tb_bug) == "testbench"
+    assert compile_error_file("design.v:14: syntax error near foo") == "design"
+    # design blamed too: a broken DUT breaks TB elaboration, so fix the DUT
+    assert compile_error_file("design.v:1: error: x\ntb_a.v:2: error: y") == "design"
+    assert compile_error_file("tb_x.v:3: error: nope") == "testbench"
+    assert compile_error_file("rtl/other.v:3: error: bad") == "design"
+    assert compile_error_file("no file references here") is None
+
+
+def test_repair_target_routes_tb_bug_to_testbench():
+    from vlab.fix import repair_target
+
+    sim = {"rc": 1, "pass_count": 0, "fail_count": 0}
+    tb_bug = "/p/tb_cnt8.v:82: error: count is not a valid l-value in tb_cnt8."
+    assert repair_target(sim, tb_bug) == "testbench"
+    assert repair_target(sim, "design.v:3: syntax error") == "design"
+    # ran but asserted wrong -> the expectations are wrong, not the DUT
+    assert repair_target({"rc": 1}, "PASS: a\nFAIL: b") == "testbench"
+
+
+def test_verify_stops_when_repair_repeats_itself(tmp_path, monkeypatch):
+    """A repair that reproduces the file byte-for-byte must not burn rounds."""
+    import vlab.auto as auto_mod
+    import vlab.llm as llm_mod
+    import vlab.sim as sim_mod
+
+    proj = _mk_fix_session(tmp_path)
+    calls = {"n": 0}
+
+    def fake_sim(*a, **k):
+        (proj / "runs" / "s1" / "sim.log").write_text(
+            "/p/tb_dut1.v:9: error: bad l-value")
+        return {"status": "fail", "pass_count": 0, "fail_count": 0, "rc": 1}
+
+    def same_every_time(*a, **k):
+        calls["n"] += 1
+        return "```verilog\nmodule tb_dut1; $finish; endmodule\n```"
+
+    monkeypatch.setattr(sim_mod, "run_simulate", fake_sim)
+    monkeypatch.setattr(llm_mod, "chat", same_every_time)
+    out = auto_mod._verify_candidate(proj, "s1", 5, {})
+    assert out["status"] == "fail"
+    assert "unchanged" in out["note"]
+    assert calls["n"] == 1  # stopped after the first no-op repair
+
+
 def test_extract_design_and_intact():
     from vlab.fix import _extract_design, _require_design_intact
 
@@ -130,16 +282,20 @@ def test_extract_design_and_intact():
 
 
 def test_fix_repairs_design_on_compile_error(tmp_path, monkeypatch):
+    """A compile error blamed on design.v must route the DUT to the LLM."""
     import vlab.fix as fix_mod
     import vlab.llm as llm_mod
     import vlab.sim as sim_mod
 
     proj = _mk_fix_session(tmp_path)
+    # start from a design that genuinely fails to compile
+    broken = "module dut1(input a, output y);\nassign y = = a;\nendmodule"
+    (proj / "runs" / "s1" / "design.v").write_text(broken)
     states = [{"status": "fail", "pass_count": 0, "fail_count": 0, "rc": 30},
               {"status": "pass", "pass_count": 1, "fail_count": 0, "rc": 0}]
 
     def fake_sim(*a, **k):
-        (proj / "runs" / "s1" / "sim.log").write_text("design.v:1: syntax error")
+        (proj / "runs" / "s1" / "sim.log").write_text("design.v:2: syntax error")
         return states.pop(0)
 
     fixed = ("```verilog\nmodule dut1(input a, output y);\n"
@@ -155,5 +311,6 @@ def test_fix_repairs_design_on_compile_error(tmp_path, monkeypatch):
     out = fix_mod.run_fix(proj, "s1", rounds=2)
     assert out["final"] == "pass"
     assert "COMPILE" in seen_prompts[0]
+    assert out["rounds"][0]["target"] == "design"
     assert (proj / "runs" / "s1" / "design.v").read_text() == (
         "module dut1(input a, output y);\nassign y = a;\nendmodule")

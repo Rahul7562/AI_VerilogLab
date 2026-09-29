@@ -24,7 +24,53 @@ def test_dominates():
     b = {"cells": 9, "crit_ns": 2.0, "power_w": 2e-4}
     assert dominates(a, b) and not dominates(b, a)
     assert not dominates(a, dict(a))  # equal => no dominance
-    assert not dominates({"cells": None, "crit_ns": 1.0, "power_w": 1e-4}, b)
+
+
+def test_dominates_skips_metrics_neither_can_compare():
+    """Missing metrics must not collapse the whole Pareto front.
+
+    With no STA there is no crit_ns for anyone. Bailing out on the first
+    None made every candidate mutually non-dominating, so the front became
+    the entire result set and search_guidance told the model every design was
+    Pareto-optimal.
+    """
+    a = {"cells": 5, "crit_ns": None, "power_w": 1e-4}
+    b = {"cells": 9, "crit_ns": None, "power_w": 2e-4}
+    assert dominates(a, b) and not dominates(b, a)
+    # nothing comparable at all -> never claim dominance
+    x = {"cells": None, "crit_ns": None, "power_w": None}
+    y = {"cells": None, "crit_ns": None, "power_w": None}
+    assert not dominates(x, y) and not dominates(y, x)
+    # worse on a comparable metric still cannot dominate, even when the
+    # metric it lacks is skipped
+    assert not dominates(
+        {"cells": 11, "crit_ns": None, "power_w": 1e-4}, b
+    )
+
+
+def test_check_constraints_treats_missing_metric_as_unchecked():
+    """No STA => no fmax. That is 'unknown', not 'violated'."""
+    from vlab.optimize import check_constraints
+
+    # fmax missing (e.g. the no-STA branch of run_ppa)
+    r = check_constraints(
+        {"cells": 59, "power_w": 1e-4, "fmax_mhz": None}, {"min_freq_mhz": 100}
+    )
+    assert r["freq_ok"] is None
+    assert r["feasible"] is None      # nothing was actually checked
+    # measured and meeting the limit
+    r2 = check_constraints(
+        {"cells": 59, "power_w": 1e-4, "fmax_mhz": 312.0}, {"min_freq_mhz": 100}
+    )
+    assert r2["freq_ok"] is True and r2["feasible"] is True
+    # measured and violating
+    r3 = check_constraints(
+        {"cells": 59, "power_w": 1e-4, "fmax_mhz": 12.0}, {"min_freq_mhz": 100}
+    )
+    assert r3["freq_ok"] is False and r3["feasible"] is False
+    # a limit of 0 is a real limit, not "unset"
+    r4 = check_constraints({"fmax_mhz": 100.0}, {"min_freq_mhz": 0})
+    assert r4["freq_ok"] is True
 
 
 def test_pareto_frontier():

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import typer
@@ -17,6 +18,32 @@ app = typer.Typer(help="AI VerilogLab — RTL gen, sim, synth, PPA.")
 console = Console()
 
 
+def _fail(msg: str) -> None:
+    """Print a clean error and exit 1 — never a traceback."""
+    console.print(f"[red]{msg}[/red]")
+    raise typer.Exit(code=1)
+
+
+def _spec_or_exit(project: str | None, session: str | None) -> tuple:
+    """resolve_project_dir + find_spec, with friendly failures."""
+    pdir = config.resolve_project_dir(project)
+    try:
+        return (pdir, *config.find_spec(pdir, session))
+    except FileNotFoundError as e:
+        _fail(str(e))
+        raise  # unreachable, keeps type checkers happy
+
+
+def _run_or_fail(fn, *args, **kwargs):
+    """Run a pipeline step, turning any failure into a clean CLI error."""
+    try:
+        return fn(*args, **kwargs)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        _fail(f"{type(e).__name__}: {e}")
+    except Exception as e:  # noqa: BLE001 - never surface a traceback
+        _fail(f"{type(e).__name__}: {e}")
+
+
 @app.callback()
 def _root(
     version: bool = typer.Option(False, "--version", help="Show version."),
@@ -28,7 +55,7 @@ def _root(
 
 @app.command("check-tools")
 def check_tools_cmd():
-    """Check EDA binaries (iverilog, verilator, yosys, abc, sta)."""
+    """Check EDA binaries (iverilog, verilator, make, yosys, abc, sta)."""
     rows = check_tools()
     table = Table(title="EDA tool status")
     table.add_column("Tool")
@@ -36,7 +63,11 @@ def check_tools_cmd():
     table.add_column("Found")
     table.add_column("Version / path")
     table.add_column("Purpose")
-    missing = 0
+    # only these are required for the default flow; gtkwave/make/verilator
+    # are optional alternatives, so naming them "missing" is misleading
+    required = {"iverilog", "vvp", "yosys"}
+    missing_required: list[str] = []
+    missing_optional: list[str] = []
     for r in rows:
         from .config import resolve_tool
 
@@ -46,30 +77,81 @@ def check_tools_cmd():
             detail, r.purpose,
         )
         if not r.found:
-            missing += 1
+            (missing_required if r.binary in required
+             else missing_optional).append(r.binary)
     console.print(table)
-    if missing:
+    if missing_required:
         console.print(
-            f"[yellow]{missing} tool(s) missing. "
-            "See README for apt install line. M3-M5 need them.[/yellow]"
+            f"[red]missing required: {', '.join(missing_required)}. "
+            "Simulation and synthesis cannot run. See README for the apt "
+            "install line or the user-space toolchain notes.[/red]"
+        )
+        raise typer.Exit(code=1)
+    if missing_optional:
+        console.print(
+            f"[yellow]optional, not installed: {', '.join(missing_optional)}."
+            + (" `make` is only needed for `--tool verilator`; the default "
+               "iverilog path works without it." if "make" in missing_optional
+               else "")
+            + "[/yellow]"
         )
     else:
         console.print("[green]All tools found.[/green]")
 
 
 @app.command("check-llm")
-def check_llm_cmd():
+def check_llm_cmd(
+    probe: bool = typer.Option(False, "--probe", help="Also sweep the fallback model pool."),
+):
     """Validate OpenRouter key + model with a tiny call."""
     from .llm import get_model
 
     console.print(f"model={get_model()}")
     console.print(f"base={config.OPENROUTER_BASE_URL}")
-    ok, msg = check_llm()
+    ok, msg = check_llm(probe_models=probe)
     if ok:
         console.print(f"[green]LLM OK: {msg}[/green]")
     else:
         console.print(f"[red]LLM FAILED: {msg}[/red]")
+        console.print(
+            "[yellow]A 429 means the free tier is rate-limited. vlab rotates "
+            "through fallback models automatically; run `vlab check-llm --probe` "
+            "to see which models are live right now.[/yellow]"
+        )
         raise typer.Exit(code=1)
+
+
+@app.command("models")
+def models_cmd(
+    probe: bool = typer.Option(False, "--probe", help="Live-test each model."),
+):
+    """Show the model + fallback pool vlab rotates through on rate limits."""
+    from .llm import fallback_models, get_api_key, get_model
+
+    primary = get_model()
+    table = Table(title="LLM model rotation (free tier)")
+    table.add_column("#")
+    table.add_column("model")
+    table.add_column("role")
+    for i, m in enumerate([primary, *fallback_models()], 1):
+        role = "primary" if i == 1 else f"fallback {i - 1}"
+        if m == primary and i > 1:
+            role += " (dup)"
+        table.add_row(str(i), m, role)
+    console.print(table)
+    console.print(
+        f"[dim]Reasoning effort: {os.getenv('VLAB_REASONING_EFFORT', 'low')} "
+        f"| free-tier limits are per-model, so vlab rotates instead of "
+        f"sleeping through them.[/dim]"
+    )
+    if probe:
+        from .llm import _probe_pool
+
+        if not get_api_key():
+            _fail("OPENROUTER_API_KEY is not set (env or .env).")
+        console.print(_probe_pool())
+    else:
+        console.print("[dim]Add --probe to test which models answer right now.[/dim]")
 
 
 @app.command("init")
@@ -118,14 +200,12 @@ def new_cmd(
             pdir, dut=dut, non_interactive=non_interactive, desc=desc,
             width=width, pdk=pdk, use_llm=use_llm, category=category,
         )
-    except (ValueError, FileNotFoundError) as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        _fail(str(e))
     try:
         spec = json.loads(Path(spec_path).read_text())
     except (OSError, json.JSONDecodeError) as e:
-        console.print(f"[red]Cannot read spec: {e}[/red]")
-        raise typer.Exit(code=1)
+        _fail(f"Cannot read spec: {e}")
     console.print(f"[green]Session:[/green] {sid}")
     console.print(f"spec: {spec_path}")
     console.print(
@@ -142,19 +222,15 @@ def gen_cmd(
     force: bool = typer.Option(False, "--force"),
 ):
     """M2: generate design.v + testbench from spec.json via OpenRouter."""
-    from .config import find_spec
     from .rtl_gen import run_gen
 
-    pdir = config.resolve_project_dir(project)
-    sid, spec_path = find_spec(pdir, session)
+    pdir, sid, spec_path = _spec_or_exit(project, session)
     try:
         m = run_gen(pdir, sid, spec_path, use_llm=use_llm, force=force)
     except FileExistsError as e:
-        console.print(f"[red]{e} Use --force to overwrite.[/red]")
-        raise typer.Exit(code=1)
+        _fail(f"{e} Use --force to overwrite.")
     except (RuntimeError, FileNotFoundError, ValueError) as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+        _fail(str(e))
     console.print(f"[green]Gen OK:[/green] {m['design']} + {m['testbench']}")
     for w in m.get("warnings", []):
         console.print(f"[yellow]WARN: {w}[/yellow]")
@@ -167,19 +243,15 @@ def simulate_cmd(
     tool: str = typer.Option("auto", "--tool", help="auto|iverilog|verilator"),
 ):
     """M3: iverilog/verilator -> wave.vcd + pass/fail."""
-    from .config import find_spec
     from .sim import run_simulate
 
-    pdir = config.resolve_project_dir(project)
-    sid, _ = find_spec(pdir, session)
-    try:
-        r = run_simulate(pdir, sid, tool=tool)
-    except RuntimeError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+    pdir, sid, _ = _spec_or_exit(project, session)
+    r = _run_or_fail(run_simulate, pdir, sid, tool=tool)
     color = "green" if r["status"] == "pass" else "red"
     console.print(f"[{color}]SIM {r['status'].upper()}[/{color}] tool={r['tool']} "
                   f"pass={r['pass_count']} fail={r['fail_count']} vcd={r.get('vcd')}")
+    if r.get("note"):
+        console.print(f"[yellow]WARN: {r['note']}[/yellow]")
     if r["status"] != "pass":
         raise typer.Exit(code=1)
 
@@ -192,16 +264,10 @@ def synth_cmd(
     lib: str = typer.Option(None, "--lib", help="Liberty file (default generic)."),
 ):
     """M4: yosys+abc -> netlist.v/json + area."""
-    from .config import find_spec
     from .synth import run_synth
 
-    pdir = config.resolve_project_dir(project)
-    sid, _ = find_spec(pdir, session)
-    try:
-        r = run_synth(pdir, sid, top=top, lib=lib)
-    except (RuntimeError, FileNotFoundError) as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+    pdir, sid, _ = _spec_or_exit(project, session)
+    r = _run_or_fail(run_synth, pdir, sid, top=top, lib=lib)
     console.print(f"[green]Synth OK:[/green] {r['netlist']} "
                   f"cells={r['area']['cell_count']} wires={r['area']['wire_count']}")
 
@@ -214,19 +280,16 @@ def ppa_cmd(
     clk: str = typer.Option("", "--clk", help="Clock port (default: from spec)."),
 ):
     """M5: openSTA timing + power (VCD) + yosys area -> ppa.json."""
-    from .config import find_spec
     from .ppa import run_ppa
 
-    pdir = config.resolve_project_dir(project)
-    sid, _ = find_spec(pdir, session)
-    try:
-        r = run_ppa(pdir, sid, freq_mhz=freq_mhz, clk_port=clk)
-    except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+    pdir, sid, _ = _spec_or_exit(project, session)
+    r = _run_or_fail(run_ppa, pdir, sid, freq_mhz=freq_mhz, clk_port=clk)
     console.print(f"[green]PPA OK:[/green] area_cells={r['area'].get('cell_count')} "
                   f"timing={r['timing'].get('method')} power={r['power'].get('method')} "
                   f"({r['power'].get('power_w')})")
+    if r["timing"].get("method") not in ("opensta",):
+        console.print(f"[yellow]note: timing method={r['timing'].get('method')} "
+                      f"{r['timing'].get('note') or r['timing'].get('error','')}[/yellow]")
 
 
 @app.command("auto")
@@ -276,9 +339,8 @@ def auto_cmd(
             iterations=iterations, max_fix_rounds=fix_rounds,
             use_llm=use_llm, freq_mhz=freq_mhz,
         )
-    except (RuntimeError, ValueError) as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+    except Exception as e:  # noqa: BLE001 - never surface a traceback
+        _fail(f"{type(e).__name__}: {e}")
     console.print(f"[green]Session:[/green] {s['session']}  "
                   f"winner={s['winner']} final={s['final']}")
     for c in s["candidates"]:
@@ -287,9 +349,32 @@ def auto_cmd(
                       f"cells={c.get('cells')} crit={c.get('crit_ns')} "
                       f"power={c.get('power_w')}{note}")
     if not s["final"]:
-        console.print("[red]No passing candidate — see sim.log in each "
-                      "candidate run dir. Re-run with more --candidates, "
-                      "more --fix-rounds, or a tighter prompt.[/red]")
+        cands = s["candidates"]
+        llm_down = [c for c in cands if "LLM call failed" in (c.get("note") or "")
+                    or "429" in (c.get("note") or "")]
+        all_err = bool(cands) and all(
+            c.get("status") in ("error", "fail") for c in cands)
+        console.print(f"[red]No passing candidate out of {len(cands)}.[/red]")
+        if llm_down and len(llm_down) == len(cands):
+            console.print(
+                "[yellow]Every candidate failed on an LLM call — the model "
+                "tier is rate-limited or unreachable, so no RTL was produced. "
+                "Run `vlab check-llm --probe` to see which free models are "
+                "live, or set a paid OPENROUTER_MODEL.[/yellow]"
+            )
+        elif all_err:
+            console.print(
+                "[yellow]Every candidate failed. Read runs/<sid>__i*c*/sim.log "
+                "for the compiler/simulation error — the per-candidate notes "
+                "above say what the repair loop hit.[/yellow]"
+            )
+        else:
+            console.print(
+                "[yellow]Simulation ran but no candidate passed. Check "
+                "runs/<sid>__i*c*/sim.log; try more --fix-rounds, more "
+                "--candidates, or a more explicit prompt.[/yellow]"
+            )
+        console.print(f"artifacts: {s['session']} (COMPARISON.md has the table)")
         raise typer.Exit(code=1)
 
 
@@ -315,21 +400,19 @@ def fix_cmd(
     rounds: int = typer.Option(3, "--rounds", help="Max LLM repair rounds."),
 ):
     """AI-debug: feed sim failures to the LLM to repair the testbench."""
-    from .config import find_spec
     from .fix import run_fix
 
-    pdir = config.resolve_project_dir(project)
-    sid, _ = find_spec(pdir, session)
-    try:
-        r = run_fix(pdir, sid, rounds=rounds)
-    except RuntimeError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+    pdir, sid, _ = _spec_or_exit(project, session)
+    r = _run_or_fail(run_fix, pdir, sid, rounds=rounds)
     for h in r["rounds"]:
+        target = h.get("target", "")
         console.print(f"round {h['round']}: {h['status']} "
-                      f"(pass={h['pass']} fail={h['fail']})")
+                      f"(pass={h['pass']} fail={h['fail']})"
+                      + (f" target={target}" if target else "")
+                      + (f" note={h['note']}" if h.get("note") else ""))
     if r["final"] != "pass":
-        raise typer.Exit(code=1)
+        _fail(f"still failing after {rounds} round(s). See sim.log in the run dir.")
+    console.print("[green]Simulation passing.[/green]")
 
 
 @app.command("report")
@@ -338,12 +421,11 @@ def report_cmd(
     project: str = typer.Option(None, "--project"),
 ):
     """M5: consolidate PPA.md."""
-    from .config import find_spec, session_dir
+    from .config import session_dir
     from .report import build_report
 
-    pdir = config.resolve_project_dir(project)
-    sid, _ = find_spec(pdir, session)
-    out = build_report(session_dir(pdir, sid))
+    pdir, sid, _ = _spec_or_exit(project, session)
+    out = _run_or_fail(build_report, session_dir(pdir, sid))
     console.print(f"[green]Report:[/green] {out}")
 
 
@@ -357,28 +439,33 @@ def run_cmd(
     force: bool = typer.Option(False, "--force", help="Regenerate RTL."),
 ):
     """Full pipeline: gen (if missing) -> simulate -> synth -> ppa -> report."""
-    from .config import find_spec, session_dir
+    from .config import session_dir
     from .ppa import run_ppa
     from .report import build_report
     from .rtl_gen import run_gen
     from .sim import run_simulate
     from .synth import run_synth
 
-    pdir = config.resolve_project_dir(project)
-    sid, spec_path = find_spec(pdir, session)
+    pdir, sid, spec_path = _spec_or_exit(project, session)
     outdir = session_dir(pdir, sid)
     if not (outdir / "design.v").exists():
-        run_gen(pdir, sid, spec_path, use_llm=use_llm, force=force)
+        try:
+            run_gen(pdir, sid, spec_path, use_llm=use_llm, force=force)
+        except FileExistsError as e:
+            _fail(f"{e} Use --force to overwrite.")
+        except (RuntimeError, FileNotFoundError, ValueError) as e:
+            _fail(str(e))
         console.print("[green]Gen OK[/green]")
-    sim = run_simulate(pdir, sid, tool=tool)
+    sim = _run_or_fail(run_simulate, pdir, sid, tool=tool)
     console.print(f"SIM {sim['status'].upper()} pass={sim['pass_count']} fail={sim['fail_count']}")
     if sim["status"] != "pass":
+        console.print(f"[yellow]{sim.get('log')} — read that for the failure.[/yellow]")
         raise typer.Exit(code=1)
-    syn = run_synth(pdir, sid)
+    syn = _run_or_fail(run_synth, pdir, sid)
     console.print(f"Synth cells={syn['area']['cell_count']}")
-    ppa = run_ppa(pdir, sid, freq_mhz=freq_mhz)
+    ppa = _run_or_fail(run_ppa, pdir, sid, freq_mhz=freq_mhz)
     console.print(f"PPA timing={ppa['timing'].get('method')} power={ppa['power'].get('power_w')}")
-    rep = build_report(outdir)
+    rep = _run_or_fail(build_report, outdir)
     console.print(f"[green]Done:[/green] {rep}")
 
 

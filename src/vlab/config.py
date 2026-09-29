@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -25,15 +26,45 @@ DEFAULT_PDK_CHOICE = "auto"
 
 
 def repo_root() -> Path:
+    """Project root when running from a source checkout.
+
+    Used only as a fallback for data files; the authoritative lookup is
+    package-relative (see `data_dir`) so an installed wheel works too.
+    """
     return Path(__file__).resolve().parents[2]
 
 
+def data_dir() -> Path:
+    """Directory holding bundled data files (pdks/).
+
+    Prefers the copy shipped inside the installed package and falls back to
+    the source checkout, so `vlab synth` finds a liberty file whether the
+    tool was `uv sync`ed from source or installed as a wheel.
+    """
+    packaged = Path(__file__).resolve().parent / "pdks"
+    if packaged.is_dir():
+        return packaged
+    return repo_root() / "pdks"
+
+
+def pdks_dir() -> Path:
+    return data_dir()
+
+
 def pdks_registry_path() -> Path:
-    return repo_root() / "pdks" / "registry.yaml"
+    return pdks_dir() / "registry.yaml"
 
 
 def generic_lib_path() -> Path:
-    return repo_root() / "pdks" / "generic.lib"
+    return pdks_dir() / "generic.lib"
+
+
+def pdk_lib_path(pdk: str | None) -> Path | None:
+    """pdks/<pdk>.lib when the user dropped one in, else None."""
+    if not pdk:
+        return None
+    cand = pdks_dir() / f"{pdk}.lib"
+    return cand if cand.exists() else None
 
 
 # --- project / session paths ---
@@ -69,6 +100,17 @@ def session_dir(project_dir: Path, session_id: str) -> Path:
     return d
 
 
+# auto-mode candidate dirs are named <sid>__i<iter>c<cand>. Match the shape
+# rather than a bare "__i" substring: a DUT legitimately named `my__int`
+# or `counter__iter` was being filtered out of the latest-session search,
+# so the CLI could silently act on the wrong session.
+_CANDIDATE_RE = re.compile(r"__i\d+c\d+$")
+
+
+def is_candidate_dir(name: str) -> bool:
+    return bool(_CANDIDATE_RE.search(name))
+
+
 def find_spec(project_dir: Path, session_id: str | None) -> tuple[str, Path]:
     """Locate spec.json for session. Returns (session_id, spec_path)."""
     sdir = sessions_dir(project_dir)
@@ -84,7 +126,8 @@ def find_spec(project_dir: Path, session_id: str | None) -> tuple[str, Path]:
     # latest session by mtime (skip auto candidate dirs: <sid>__i<c>c<d>)
     candidates = sorted(
         [d for d in sdir.iterdir()
-         if d.is_dir() and (d / "spec.json").exists() and "__i" not in d.name],
+         if d.is_dir() and (d / "spec.json").exists()
+         and not is_candidate_dir(d.name)],
         key=lambda d: (d / "spec.json").stat().st_mtime,
     )
     if not candidates:
@@ -92,7 +135,8 @@ def find_spec(project_dir: Path, session_id: str | None) -> tuple[str, Path]:
         rdir = runs_dir(project_dir)
         candidates = sorted(
             [d for d in rdir.iterdir()
-             if d.is_dir() and (d / "spec.json").exists() and "__i" not in d.name],
+             if d.is_dir() and (d / "spec.json").exists()
+             and not is_candidate_dir(d.name)],
             key=lambda d: (d / "spec.json").stat().st_mtime,
         )
     if not candidates:
