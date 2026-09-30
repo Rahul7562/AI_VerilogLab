@@ -154,6 +154,101 @@ def models_cmd(
         console.print("[dim]Add --probe to test which models answer right now.[/dim]")
 
 
+@app.command("rel")
+def rel_cmd(
+    prompt: str = typer.Argument(..., help="The one-line design request."),
+    runs: int = typer.Option(5, "--runs", "-n", min=1, max=20,
+                             help="Independent attempts to measure."),
+    dut: str = typer.Option("dut", "--dut", help="DUT name."),
+    project: str = typer.Option(None, "--project"),
+    candidates: int = typer.Option(2, "--candidates"),
+    iterations: int = typer.Option(1, "--iterations"),
+    fix_rounds: int = typer.Option(3, "--fix-rounds"),
+    parallel: int = typer.Option(3, "--parallel", min=1, max=8,
+                                 help="Attempts to run at once."),
+    use_llm: bool = typer.Option(True, "--llm/--no-llm"),
+):
+    """Measure reliability: run one prompt N times, report the true win rate.
+
+    A single run proves nothing about reliability. This runs the same prompt
+    several times and prints the observed rate, per-attempt outcomes and the
+    reason each failure hit, so a prompt's difficulty is a number rather
+    than an impression. Use it before trusting a workflow on a new design.
+    """
+    import concurrent.futures
+    import time
+
+    from .auto import run_auto
+    from .config import resolve_project_dir
+
+    pdir = resolve_project_dir(project)
+    started = time.time()
+    table = Table(title=f"Reliability: {runs} run(s) of \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
+    table.add_column("#", justify="right")
+    table.add_column("result", justify="center")
+    table.add_column("rounds", justify="right")
+    table.add_column("passes", justify="right")
+    table.add_column("why it failed")
+
+    results: list[dict] = []
+    lock = __import__("threading").Lock()
+
+    def one(i: int) -> dict:
+        try:
+            s = run_auto(
+                pdir, prompt, dut=f"{dut}_r{i}" if runs > 1 else dut,
+                candidates=candidates, iterations=iterations,
+                max_fix_rounds=fix_rounds, use_llm=use_llm,
+            )
+        except Exception as e:  # noqa: BLE001 - one attempt must not kill the sweep
+            return {"i": i, "error": f"{type(e).__name__}: {e}"[:160]}
+        with lock:
+            results.append(s)
+        return {
+            "i": i,
+            "sid": s["session"],
+            "win": bool(s.get("winner")),
+            "rounds": s.get("rounds_run", s.get("iterations")),
+            "note": next(
+                (c.get("note", "") for c in s.get("candidates", [])
+                 if c.get("status") != "pass" and c.get("note")), ""
+            )[:70],
+            "passes": max((c.get("passes", 0) for c in s.get("candidates", [])),
+                          default=0),
+        }
+
+    order: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+        for r in ex.map(one, range(1, runs + 1)):
+            order.append(r)
+
+    wins = 0
+    for r in sorted(order, key=lambda x: x["i"]):
+        if r.get("error"):
+            table.add_row(str(r["i"]), "[red]error[/red]", "-", "-", r["error"])
+            continue
+        if r["win"]:
+            wins += 1
+            table.add_row(str(r["i"]), "[green]WINNER[/green]",
+                          str(r["rounds"]), str(r["passes"]), "")
+        else:
+            table.add_row(str(r["i"]), "[red]no winner[/red]",
+                          str(r["rounds"]), str(r["passes"]), r["note"])
+    console.print(table)
+    pct = 100.0 * wins / max(len(order), 1)
+    console.print(
+        f"[bold]win rate: {wins}/{len(order)} = {pct:.0f}%[/bold]  "
+        f"({time.time() - started:.0f}s)"
+    )
+    if pct < 100.0:
+        console.print(
+            "[dim]Failures are the data. Raise --fix-rounds or --candidates, "
+            "or try VLAB_ESCALATION_ROUNDS=3. A failing run always records "
+            "why in runs/<sid>/auto.json -> candidates[].note.[/dim]"
+        )
+    raise typer.Exit(code=0)
+
+
 @app.command("init")
 def init_cmd(
     path: str = typer.Option(".", "--path", help="Target directory."),

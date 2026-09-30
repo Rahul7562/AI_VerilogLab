@@ -12,27 +12,95 @@ from . import config
 # gen/repair calls never trip provider rate limits (default 3s).
 _throttle_lock = threading.Lock()
 _last_call_ts = 0.0
+# last call time per model, so parallel candidates sharing a model are
+# serialised instead of racing into the provider's per-model rate limit
+_last_call_by_model: dict[str, float] = {}
 
 
 def _min_interval() -> float:
+    """Seconds to wait between consecutive calls, process-wide.
+
+    The default guarantees at most `1 / VLAB_LLM_RPS` requests per second.
+    OpenRouter enforces a per-model rate limit and answers anything above it
+    with 429 rather than queueing, so a fixed 3s sleep happened to stay under
+    the free-tier ceiling only by accident. Expressing the limit as a rate
+    makes the budget explicit: the default leaves headroom below 15 RPS, and
+    the sleep grows automatically if the ceiling is lowered.
+    """
+    try:
+        rps = float(os.getenv("VLAB_LLM_RPS", "10"))
+    except ValueError:
+        rps = 10.0
+    if rps > 0:
+        floor = 1.0 / rps
+        try:
+            override = float(os.getenv("VLAB_LLM_MIN_INTERVAL", "3.0"))
+        except ValueError:
+            override = 3.0
+        return max(override, floor) if override > 0 else floor
     try:
         return max(0.0, float(os.getenv("VLAB_LLM_MIN_INTERVAL", "3.0")))
     except ValueError:
-        return 3.0
+        return 0.0
 
 
-def _throttle() -> None:
+def _throttle(model: str = "") -> None:
+    """Process-wide rate gate.
+
+    Two independent ceilings apply, because OpenRouter rate-limits per model
+    AND the account has its own limits:
+
+    - a per-model gap, so N threads sharing one model cannot add up to
+      N x the allowed rate. Parallel candidates all call the same primary
+      model, so without this a 3-candidate run issues 3 calls in a burst and
+      earns a 429 the instant the ceiling is reached.
+    - a global gap, which bounds the account-level request rate regardless of
+      how the calls are spread across models.
+
+    Measured on the switch to `poolside/laguna-s-2.1:free`: with only a
+    single global timestamp, three parallel candidates issued calls ~0.7s
+    apart and a full run stalled with no output for minutes.
+    """
     global _last_call_ts
     gap = _min_interval()
     if gap <= 0:
         return
+    now = time.monotonic()
     with _throttle_lock:
-        now = time.monotonic()
+        # Remaining wait = gap - time since the last relevant call. Start at
+        # 0, not `gap`: seeding it with `gap` forced a sleep even when the
+        # previous call was long finished, adding latency to every call and
+        # making the first call in a process wait needlessly.
         wait = gap - (now - _last_call_ts)
+        if model:
+            last = _last_call_by_model.get(model, 0.0)
+            wait = max(wait, gap - (now - last))
         if wait > 0:
             time.sleep(wait)
             now = time.monotonic()
         _last_call_ts = now
+        if model:
+            _last_call_by_model[model] = now
+
+
+def _throttle_wait_seconds(model: str = "") -> float:
+    """How long the next call would wait, without sleeping. Used by tests."""
+    gap = _min_interval()
+    if gap <= 0:
+        return 0.0
+    now = time.monotonic()
+    wait = max(0.0, gap - (now - _last_call_ts))
+    if model:
+        wait = max(wait, gap - (now - _last_call_by_model.get(model, 0.0)))
+    return wait
+
+
+def _cooldown_threshold() -> int:
+    """Consecutive 429s after which a model is abandoned for this call."""
+    try:
+        return max(1, int(os.getenv("VLAB_LLM_429_COOLDOWN", "2")))
+    except ValueError:
+        return 2
 
 
 def get_api_key() -> str:
@@ -121,6 +189,20 @@ def _retry_after_seconds(err: Exception, default: float) -> float:
     return default
 
 
+def _max_tokens_ceiling() -> int:
+    """Upper bound for the automatic length-cutoff boost.
+
+    The old hardcoded 8192 was marginal: a single measured traffic-light
+    reply (design + full testbench as one JSON string) reached 7,657
+    tokens, and JSON-escaped Verilog costs ~4 chars/token on top of the
+    source. Anything above that ceiling silently truncates forever.
+    """
+    try:
+        return max(4096, int(os.getenv("VLAB_LLM_MAX_TOKENS_CAP", "32768")))
+    except ValueError:
+        return 32768
+
+
 def _reasoning_params() -> dict[str, Any] | None:
     """Reasoning controls for thinking models (env-overridable).
 
@@ -191,10 +273,15 @@ def chat(
     last_err: Exception | None = None
     last_model = primary
     for model in queue:
-        boosted = False  # one free budget bump on length cutoffs
         attempts_left = retries + 1
+        # Consecutive 429s from one model mean we are being throttled, not
+        # unlucky: the free tier answers above its rate limit with 429 rather
+        # than queueing. Retrying the same model with the same cadence just
+        # walks into the same wall and burns the whole rotation on it. Cool
+        # off, then move on; `VLAB_LLM_429_COOFFOWN` skips the model entirely.
+        consecutive_429 = 0
         while attempts_left > 0:
-            _throttle()
+            _throttle(model)
             try:
                 resp = client.chat.completions.create(
                     model=model,
@@ -206,14 +293,31 @@ def chat(
                 )
                 choices = resp.choices or []
                 text = (choices[0].message.content if choices else None) or ""
-                if not text.strip():
-                    finish = getattr(
-                        choices[0] if choices else None, "finish_reason", "?"
+                finish = getattr(
+                    choices[0] if choices else None, "finish_reason", "?"
+                )
+                # A length cutoff is TRUNCATION, not an empty reply: the
+                # answer is cut mid-JSON and is unusable even when the
+                # partial text is non-empty. This check used to sit inside
+                # `if not text.strip()`, so a non-empty truncated reply was
+                # returned to the caller, failed JSON parsing, and killed
+                # the candidate ("Could not parse LLM output" — 10 of 34
+                # historical candidate failures; "empty model reply
+                # (finish=length)" — 7 more). Retry with a bigger budget
+                # instead, and never hand back partial text.
+                if finish == "length":
+                    ceiling = _max_tokens_ceiling()
+                    if max_tokens < ceiling:
+                        max_tokens = min(ceiling, max_tokens * 2)
+                        continue
+                    last_err = RuntimeError(
+                        f"reply truncated at finish=length "
+                        f"(max_tokens={max_tokens} exhausted)"
                     )
-                    if finish == "length" and not boosted and max_tokens < 8192:
-                        max_tokens = min(8192, max_tokens * 2)
-                        boosted = True
-                        continue  # thinking ate the budget; retry bigger
+                    last_model = model
+                    attempts_left -= 1
+                    continue
+                if not text.strip():
                     last_err = RuntimeError(
                         f"empty model reply (finish={finish})"
                     )
@@ -235,6 +339,12 @@ def chat(
                 if "401" in msg or "auth" in msg.lower() or "api key" in msg.lower():
                     raise RuntimeError(f"OpenRouter auth failed: {msg}"[:400])
                 if _is_model_scoped_error(msg):
+                    if "429" in msg or "rate limit" in msg.lower():
+                        consecutive_429 += 1
+                        if consecutive_429 >= _cooldown_threshold():
+                            # this model is saturated for now; another model
+                            # will answer
+                            break
                     used = (retries + 1) - attempts_left
                     if attempts_left > 1:
                         # brief backoff before trying the same model again

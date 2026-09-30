@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -59,11 +60,18 @@ def run_synth(
     session_id: str,
     top: str | None = None,
     lib: str | None = None,
-    timeout: int = 180,
+    timeout: int | None = None,
 ) -> dict[str, Any]:
     yosys = resolve_tool("yosys")
     if not yosys:
         raise RuntimeError("yosys not found. Install yosys or set VLAB_YOSYS_BIN.")
+    if timeout is None:
+        # abc mapping a wide design can exceed 180s, and a timeout discarded a
+        # candidate that had already passed simulation
+        try:
+            timeout = max(30, int(os.getenv("VLAB_SYNTH_TIMEOUT", "600")))
+        except ValueError:
+            timeout = 600
     outdir = session_dir(project_dir, session_id)
     spec = json.loads((outdir / "spec.json").read_text())
     dut = top or spec["dut_name"]
@@ -119,5 +127,10 @@ def run_synth(
         # contain an error; don't leave a bogus cell_count behind
         area["error"] = f"yosys rc={rc}"
         (outdir / "area.json").write_text(json.dumps(area, indent=2))
+        if rc == 124:
+            raise RuntimeError(
+                f"yosys timed out after {timeout}s. Raise VLAB_SYNTH_TIMEOUT "
+                f"or simplify the design. See {outdir / 'synth.log'}"
+            )
         raise RuntimeError(f"yosys failed rc={rc}. See {outdir / 'synth.log'}")
     return res

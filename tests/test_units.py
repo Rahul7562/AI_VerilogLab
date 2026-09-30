@@ -456,7 +456,13 @@ def test_sanitize_testbench():
     assert warns  # reports the move
     good = "`timescale 1ns/1ps\nmodule tb_foo;\n$finish;\nendmodule\n"
     fixed2, warns2 = sanitize_testbench(good, "foo")
-    assert fixed2 == good and warns2 == []  # idempotent
+    # every sanitized TB now carries a watchdog, so the first pass is not a
+    # no-op; the second must be, or repeated sanitization would keep
+    # rewriting the file and defeat the no-op repair guard.
+    assert "vlab watchdog" in fixed2 and warns2
+    fixed3, warns3 = sanitize_testbench(fixed2, "foo")
+    assert fixed3 == fixed2, "sanitize_testbench must be idempotent"
+    assert warns3 == []
     with pytest.raises(ValueError, match="\\$finish"):
         sanitize_testbench("module tb_foo;\nendmodule\n", "foo")
     with pytest.raises(ValueError, match="wrong module"):

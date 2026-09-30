@@ -23,7 +23,86 @@ Rules:
 - The testbench must drive and check EVERY port in the spec. Declare a DUT
   output as `wire` (or `reg` only if the TB assigns it) and never assign to
   a DUT output signal.
-- Sequential testbench discipline (this is the #1 source of failing checks):
+
+THE SPEC IS THE GROUND TRUTH. The testbench must assert what the spec says,
+not what the design happens to do.
+- Every output value you assert must trace to an explicit spec sentence
+  (features / test_plan). If the spec says reset forces all-red, then the
+  first check after asserting reset expects the red outputs asserted — do NOT
+  assert whatever your design's reset branch happens to drive.
+- Do not invent features the spec does not mention (no extra phases, no extra
+  ports, no extra parameterisation the spec did not ask for).
+- Implement EVERY feature listed in the spec, including ones that look like
+  an afterthought.
+
+OUTPUT DECLARATIONS (this is the single most common hard compile error):
+- In Verilog-2005 a bare `output` defaults to `wire`, and a wire is NOT a
+  procedural l-value. Declaring `output wire x` and then assigning `x` inside
+  an always block is a COMPILE ERROR ("x is not a valid l-value").
+- If an output is driven inside an always/initial block, declare it
+  `output reg x` (or `output logic x` only if you avoid SystemVerilog).
+- Only keep `output wire x` when x is driven by a continuous `assign`.
+
+CLOCK / TIMING CONVENTION (DUT and testbench MUST agree):
+- Pick ONE clock convention and apply it identically in both files, e.g. a
+  `parameter integer CLK_HZ` on the DUT with the testbench overriding it.
+- Never let the testbench wait a different number of cycles than the DUT
+  counts. Derive every wait from the same expression the DUT uses for its
+  counter limit. A testbench that hard-codes cycle counts while the DUT
+  computes them from a different parameter will fail.
+- Every phase must get its OWN duration taken from the spec. If the spec says
+  green is 10 seconds and yellow is 2 seconds, the DUT must use two different
+  limits — a single shared counter constant for all phases does NOT implement
+  the spec.
+- The testbench MUST assert durations, not just the order of states. Measure
+  them with ONE free-running monitor that timestamps every state change and
+  records how long each state lasted, then assert the recorded durations at
+  the end of run:
+      always @(posedge clk) #1 begin
+        if (snap != prev) begin
+          t = $time / 10;
+          if (prev != IDLE) dur[prev] = t - prev_t;
+          prev_t = t; prev = snap;
+        end
+      end
+  ...
+      if (dur[YELLOW] != YELLOW_CYCLES) $display("FAIL: yellow %0d", dur[YELLOW]);
+      else                               $display("PASS: yellow %0d cycles", YELLOW_CYCLES);
+  Do NOT measure one phase with a task and then hand off to a task for the
+  next: the handover loses the cycle it happened in, so every phase after the
+  first reads exactly one cycle short and the DUT is wrongly reported broken.
+  A testbench that only waits for transitions and never measures HOW LONG
+  also cannot detect a design whose phases are 5x too long.
+
+COUNTER WIDTH (a design that cannot count is not repairable):
+- Size every counter, timer and limit register wide enough to hold the
+  largest duration in the spec, plus one. A phase of 10 cycles needs at
+  least 4 bits; `reg [1:0] count` wraps at 3 and the design can then never
+  reach the state the testbench is waiting for. When a duration is a
+  parameter, the register must be wide enough for the parameter's maximum.
+- Prefer 8 bits for a generic phase counter; it costs almost nothing in area
+  and removes the whole failure class.
+
+BLACK-BOX TESTBENCH (never peek inside the DUT):
+- The testbench must observe ONLY the DUT's output ports. Never reference
+  `dut.<internal signal>` — not `dut.state`, not `dut.count`, not a localparam.
+  A hierarchical reference ties the testbench to one specific internal
+  encoding; if the DUT numbers its states differently the wait never
+  completes and no repair round can fix it.
+- Identify a phase from the OUTPUTS (which lights are lit), not from an
+  internal state register. Keep your own phase names local to the testbench
+  and map them to output patterns.
+- If you need a monitor, tap the output wires, not the DUT internals.
+
+COVERAGE (this decides whether the candidate is accepted at all):
+- Write at least one check for EVERY feature in the spec's `features` list,
+  including enable/gating, hold/freeze, and extension behaviour. A feature
+  with no check is treated as unimplemented and the candidate is rejected.
+- A reset check, a sequence check and a grant check are NOT enough on their own.
+- If the spec mentions a signal that gates, freezes, extends or resets
+  something, the testbench MUST drive that signal and assert its effect.
+
+Sequential testbench discipline (this is the #1 source of failing checks):
   drive stimulus at negedge clk, sample outputs #1 after posedge clk, keep
   the clock in its own `initial` block. Count cycles from the first edge on
   which the DUT actually samples your value: if a DUT updates y at posedge
@@ -31,13 +110,70 @@ Rules:
   values from the DUT's declared widths (8-bit wraps at 255->0).
 - No markdown fences inside code. Output valid JSON only:
 {{"design": "<verilog>", "testbench": "<verilog>", "notes": "<short>"}}
+The whole reply must fit in one message; keep the design tight.
 Spec:
 {spec}
 """
 
 
+def gen_attempts() -> int:
+    """How many times to re-ask for a usable design+testbench before failing."""
+    import os
+
+    try:
+        return max(1, min(6, int(os.getenv("VLAB_GEN_ATTEMPTS", "3"))))
+    except ValueError:
+        return 3
+
+
+def gen_max_tokens() -> int:
+    """Token budget for one design+testbench reply.
+
+    The old default of 4096 was below what this pipeline actually needs: the
+    DUT and its testbench travel as a single JSON string, so every newline
+    costs an escape and the whole reply runs ~4 chars/token. A measured
+    traffic-light reply reached 30,630 chars (~7.6k tokens) and was cut off
+    mid-JSON, which surfaced downstream as a parse failure. llm.chat also
+    doubles this automatically on a `finish_reason: length` cutoff.
+    """
+    import os
+
+    try:
+        return max(4096, int(os.getenv("VLAB_GEN_MAX_TOKENS", "16384")))
+    except ValueError:
+        return 16384
+
+
 def _extract_code_blocks(text: str) -> list[str]:
     return re.findall(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", text, re.S)
+
+
+def _salvage_json_string(text: str, key: str) -> str | None:
+    """Extract a (possibly truncated) JSON string value for `key`.
+
+    A reply cut off by a token limit has no closing quote or brace, so
+    json.loads cannot see it and the whole candidate is lost. Recovering the
+    partial value lets the sanitizer close the module and lets the simulator
+    report a real Verilog error instead of a parse error.
+    """
+    m = re.search(rf'"{key}"\s*:\s*"', text)
+    if not m:
+        return None
+    i = m.end()
+    buf: list[str] = []
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            buf.append({"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(nxt, nxt))
+            i += 2
+            continue
+        if ch == '"':
+            break
+        buf.append(ch)
+        i += 1
+    val = "".join(buf)
+    return val if val.strip() else None
 
 
 def parse_llm_output(text: str, dut: str) -> tuple[str, str, str]:
@@ -60,6 +196,14 @@ def parse_llm_output(text: str, dut: str) -> tuple[str, str, str]:
                     return obj["design"], obj.get("testbench", ""), str(obj.get("notes", ""))
             except (json.JSONDecodeError, ValueError):
                 continue
+    # truncated JSON: recover the two fields by hand before giving up
+    salvaged_d = _salvage_json_string(t, "design")
+    salvaged_t = _salvage_json_string(t, "testbench")
+    if salvaged_d and re.search(rf"\bmodule\s+{re.escape(dut)}\b", salvaged_d):
+        tb_src = salvaged_t or ""
+        if tb_src and not re.search(rf"\bmodule\s+tb_{re.escape(dut)}\b", tb_src):
+            tb_src = ""
+        return salvaged_d, tb_src, ""
     blocks = _extract_code_blocks(t)
     if len(blocks) >= 2:
         return blocks[0], blocks[1], ""
@@ -305,10 +449,16 @@ def run_gen(
     spec_path: Path,
     use_llm: bool = True,
     force: bool = False,
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,
     guidance: str = "",
+    feedback: str = "",
 ) -> dict[str, Any]:
-    """Generate design.v + tb. Returns manifest dict."""
+    """Generate design.v + tb. Returns manifest dict.
+
+    `guidance` steers architecture choice (from measured PPA results);
+    `feedback` reports what already failed in this run so the next
+    candidate does not repeat it.
+    """
     from .config import session_dir
 
     spec = json.loads(spec_path.read_text())
@@ -327,72 +477,106 @@ def run_gen(
 
         if not get_api_key():
             raise RuntimeError("OPENROUTER_API_KEY not set. Use --no-llm for template.")
+        budget = max_tokens or gen_max_tokens()
         prompt = GEN_PROMPT.format(dut=dut, spec=json.dumps(spec, indent=2))
         if guidance:
             prompt += f"\nPrior exploration guidance (follow it):\n{guidance}\n"
-        raw = llm_chat(
-            [
-                {
-                    "role": "system",
-                    "content": "You output only JSON with design + testbench Verilog.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.2,
-        )
-        (outdir / "gen_raw.txt").write_text(raw)
-        first_error = ""
-        try:
-            design, tb, notes = parse_llm_output(raw, dut)
-            _require_sane(design, tb, dut)
-            _require_ports(design, spec)
-            _require_tb_ports(tb, spec)
-        except ValueError as e:
-            first_error = str(e)[:200]
-            # retry with the FULL prompt (truncated/placeholder first replies
-            # are common on loaded free-tier models; a bare nudge invites
-            # generic examples, so resend the task with a strict trailer)
-            raw2 = llm_chat(
+        if feedback:
+            prompt += f"\n{feedback}\n"
+        # Retry a few times before giving up on the candidate. Truncated or
+        # placeholder replies are routine on a loaded free tier; a single
+        # retry still lost whole candidates ("Could not parse LLM output"
+        # was the single largest failure bucket in run history). Each
+        # attempt resends the FULL prompt with the concrete rejection reason
+        # and a distinct temperature, so a repeated failure changes
+        # something rather than re-rolling the same dice.
+        attempts = gen_attempts()
+        design = tb = ""
+        last_err = ""
+        for attempt in range(1, attempts + 1):
+            msg = prompt
+            if last_err:
+                msg += (
+                    "\nIMPORTANT: your previous reply was rejected: "
+                    + last_err
+                    + "\nOutput ONLY one complete JSON object "
+                    '{"design": "...", "testbench": "...", "notes": "..."}, '
+                    "no prose, no fences. Keep the whole reply under "
+                    f"{budget} tokens."
+                )
+            raw = llm_chat(
                 [
                     {
                         "role": "system",
                         "content": "You output only JSON with design + testbench Verilog.",
                     },
-                    {"role": "user", "content": prompt + (
-                        "\nIMPORTANT: your previous reply was rejected: "
-                        + first_error
-                        + "\nOutput ONLY one complete JSON object "
-                        "{\"design\": \"...\", \"testbench\": \"...\", "
-                        "\"notes\": \"...\"}, no prose, no fences.")},
+                    {"role": "user", "content": msg},
                 ],
-                max_tokens=max_tokens,
-                temperature=0.1,
+                max_tokens=budget,
+                temperature=0.2 if attempt == 1 else 0.4,
             )
-            (outdir / "gen_raw_retry.txt").write_text(raw2)
-            design, tb, notes = parse_llm_output(raw2, dut)
-            _require_sane(design, tb, dut)
-            _require_ports(design, spec)
-            _require_tb_ports(tb, spec)
-        if first_error:
-            # surface the first rejection so a run that only barely worked
-            # is diagnosable from gen.json alone
-            warns_pre = [f"first attempt rejected: {first_error}"]
+            if attempt == 1:
+                suffix = "gen_raw.txt"
+            elif attempt == 2:
+                # keep the historical name so existing docs/scripts find it
+                suffix = "gen_raw_retry.txt"
+            else:
+                suffix = f"gen_raw_retry{attempt - 1}.txt"
+            (outdir / suffix).write_text(raw)
+            try:
+                d, t, n = parse_llm_output(raw, dut)
+                _require_sane(d, t, dut)
+                _require_ports(d, spec)
+                _require_tb_ports(t, spec)
+            except ValueError as e:
+                last_err = str(e)[:200]
+                if attempt == 1:
+                    warns_pre = [f"first attempt rejected: {last_err}"]
+                continue
+            design, tb, notes = d, t, n
+            break
         else:
-            warns_pre = []
+            raise ValueError(
+                f"LLM generation unusable after {attempts} attempt(s): {last_err}"
+            )
         llm_used = True
     else:
         design, tb = builtin_template(spec)
         notes = "builtin offline template (no LLM)"
 
-    from .fix import sanitize_design, sanitize_testbench
+    from .fix import (
+        sanitize_design,
+        sanitize_testbench,
+        undersized_counters,
+        white_box_refs,
+    )
 
     # Both files are compiled by iverilog and yosys, so a botched directive
     # fails the whole candidate. Fix deterministically rather than spending
     # a repair round on a one-character mistake.
-    design, d_warns = sanitize_design(design)
+    design, d_warns = sanitize_design(design, dut)
     tb, san_warns = sanitize_testbench(tb, dut)
     warns = warns_pre + d_warns + _validate(design, tb) + san_warns
+
+    # Structural defects that compile cleanly and simulate, but make the
+    # candidate unable to converge. They are not fixable here, so record them
+    # for the repair loop to act on and for the user to see in gen.json.
+    narrow = undersized_counters(design)
+    if narrow:
+        warns.append(
+            "counter/limit register too narrow to hold the spec's durations: "
+            + ", ".join(narrow)
+            + " -- the design cannot satisfy timed phases and the testbench "
+            "can never agree with it"
+        )
+    peek = white_box_refs(tb, "")
+    if peek:
+        warns.append(
+            "testbench is white-box, it reads DUT internals: "
+            + ", ".join(f"dut.{p}" for p in peek)
+            + " -- it must observe outputs only, or it is tied to this "
+            "particular state encoding"
+        )
     design_p.write_text(design)
     tb_p.write_text(tb)
     manifest = {

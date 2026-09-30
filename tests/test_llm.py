@@ -70,6 +70,11 @@ def test_chat_no_retry_on_auth(monkeypatch):
 def test_chat_backs_off_on_429(monkeypatch):
     import vlab.llm as llm_mod
 
+    # The default cooldown abandons a model after 2 consecutive 429s, which
+    # would rotate before the third call this test expects. Pin it high so
+    # this test exercises the backoff schedule, not the rotation policy
+    # (which test_repeated_429_abandons_a_saturated_model covers).
+    monkeypatch.setenv("VLAB_LLM_429_COOLDOWN", "99")
     calls, sleeps = [], []
 
     class R429Completions:
@@ -90,6 +95,8 @@ def test_chat_backs_off_on_429(monkeypatch):
     monkeypatch.setenv("VLAB_REASONING_EFFORT", "off")
     monkeypatch.setitem(sys.modules, "openai", mod)
     monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
+    # throttle sleeps are real here; neutralise only the inter-call gate
+    monkeypatch.setattr(llm_mod, "_throttle", lambda *a, **k: None)
     assert llm_mod.chat([{"role": "user", "content": "hi"}], retries=3) == "late-ok"
     assert sleeps == [7.0, 7.0]  # Retry-After honored, no busy retry
 
@@ -136,16 +143,20 @@ def test_throttle_spacing(monkeypatch):
     import vlab.llm as llm_mod
 
     monkeypatch.delenv("VLAB_LLM_MIN_INTERVAL", raising=False)
+    monkeypatch.delenv("VLAB_LLM_RPS", raising=False)
     assert llm_mod._min_interval() == 3.0
     sleeps = []
     monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
     now = [1000.0]
     monkeypatch.setattr(llm_mod.time, "monotonic", lambda: now[0])
-    llm_mod._last_call_ts = 999.0  # 1s ago -> must wait ~2s
+    # this test drives the GLOBAL gate, so the ledger must not veto with a
+    # 3s wait of its own
+    monkeypatch.setattr(llm_mod, "_last_call_by_model", {})
+    monkeypatch.setattr(llm_mod, "_last_call_ts", 999.0)  # 1s ago -> wait ~2s
     llm_mod._throttle()
     assert sleeps and abs(sleeps[0] - 2.0) < 0.01
     now[0] = 1000.0
-    llm_mod._last_call_ts = 990.0  # 10s ago -> no wait
+    monkeypatch.setattr(llm_mod, "_last_call_ts", 990.0)  # 10s ago -> no wait
     llm_mod._throttle()
     assert len(sleeps) == 1
 

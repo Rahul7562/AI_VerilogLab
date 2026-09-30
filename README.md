@@ -46,6 +46,7 @@ checkout does.
 | `report` | Consolidate `PPA.md` |
 | `run` | gen -> simulate -> synth -> ppa -> report |
 | `auto` | The full autonomous loop (below) |
+| `rel` | Measure a prompt's real win rate over N runs |
 | `serve` | Localhost web dashboard |
 
 ```bash
@@ -80,25 +81,125 @@ guidance for the next generation) -> **OUTPUT** (`final/` plus
 Useful flags: `--width`, `--iterations`, `--fix-rounds`, `--freq-mhz`,
 `--no-clarify` (skip the clarification prompt), `--no-llm`.
 
+### It retries instead of giving up, and it learns
+
+If a whole round produces zero passing candidates, the run does not return
+"no winner". It escalates: each extra round widens the search (more
+candidates) and the concrete failures from the previous rounds are fed into
+the next generation prompt, so attempt *n+1* knows what attempts *1..n* got
+wrong instead of repeating them. Per-attempt success on a hard FSM is well
+under 50%, so stopping after one failed round discards most of the available
+probability.
+
+Escalation is bounded by `VLAB_ESCALATION_ROUNDS` (default `2`, `0` restores
+the old give-up-after-`--iterations` behaviour). A round that produces a
+winner is never escalated past — that would multiply API spend for no
+reliability gain. The requested `--iterations` still means "keep exploring for
+a better point on the frontier", which is independent of escalation.
+
+Escalation is also bounded by wall clock. A round is `candidates` generations
+plus up to `--fix-rounds` repair calls each, so the worst case is long;
+`VLAB_TIME_BUDGET_S` (default `2400`, `0` disables) stops escalation adding
+candidates once it is spent, and `auto.json` records `timed_out` and
+`elapsed_s` so a run that ended on the clock explains itself instead of
+looking like the search simply gave up.
+
 ### How a winner is chosen
 
 Candidates that pass simulation are ranked by: feasible-under-limits
 first, then lowest power, then shortest critical path, then fewest cells.
 A missing measurement is treated as *unknown*, never as a violation.
 
+A candidate is only published as a winner if it clears three bars, not one:
+simulation passes, **at least `max(5, len(features))` checks actually ran**,
+and the spec-coverage audit finds no feature the DUT gets wrong. The check
+floor matters: `sim._parse_result` accepts any run with one PASS, and a
+candidate was measured shipping as a "winner" with a single assertion.
+
+A coverage gap of kind `unimplemented` or `incorrect` blocks publication — the
+design violates the spec. A gap of kind `unchecked` does not: the testbench is
+merely not exhaustive, and rejecting there threw away candidates that had
+already passed 24–50 real checks.
+
 Two guards protect against winning by cheating:
 
 - **Repair routing.** A compile error is repaired in whichever file the
-  compiler actually named. A testbench bug is fixed in the testbench; a DUT
-  bug in the DUT. (Repairing the wrong file can never converge — the model
-  just re-emits the unchanged file.)
+  compiler actually named. For a *runtime* failure the culprit is decided
+  against the **spec**, not against the other file: the model is asked which
+  single file is wrong given the spec, the DUT, the testbench and the failing
+  checks. Repairing the wrong file can never converge, and always blaming the
+  testbench is worse than useless — it converges a spec-violating DUT with a
+  testbench rewritten to match it and publishes the pair.
 - **Anti-weakening.** The first passing testbench is frozen as
   `golden_tb_<dut>.v`. If a candidate you *repaired* then passes fewer
   checks than that bar, it is rejected. Independent candidates are not
   penalised for having a different number of checks.
+- **Spec coverage.** Passing simulation only proves the DUT agrees with the
+  testbench. Before a candidate can be published it is audited against the
+  spec's `features`: a feature that is unimplemented, or implemented but
+  never actually checked, is reported as a gap and sent back through repair
+  rather than shipped. (Without this, a design can pass 19/19 checks using
+  one shared counter for every phase while the spec demanded four different
+  durations.)
 
-A repair that returns its input byte-for-byte (modulo comments/whitespace)
-stops the loop immediately rather than burning the remaining rounds.
+A repair that returns its input byte-for-byte (modulo comments/whitespace
+and the sanitizer's own injected lines) stops the loop immediately rather
+than burning the remaining rounds.
+
+### What is repaired without asking the model
+
+These are mechanical, semantics-preserving fixes applied before a candidate is
+simulated, because spending an LLM repair round on a one-word slip is slow,
+costs rate-limit budget, and does not reliably work:
+
+| Fix | Symptom it prevents |
+|---|---|
+| missing `` `timescale `` backtick | `design.v:1: syntax error` |
+| `output wire` promoted to `output reg` | `x is not a valid l-value` (18 errors from one modelling slip) |
+| task-call arity padded to match the declaration | `error: Missing argument N of call to task` |
+| simulator watchdog appended | a bare `wait` that never completes hangs until the tool timeout, leaving a log with no PASS and no FAIL |
+| white-box testbench flagged | a testbench reading `dut.state` is tied to one internal encoding and never converges |
+| narrow counter flagged | `reg [1:0] count` cannot hold a 10-cycle phase, so the design can never satisfy the spec |
+
+The last two are *not* auto-fixed — a testbench cannot be mechanically
+rewritten into a black-box check, and widening a counter is a design change.
+They are detected, reported in `gen.json` warnings, and fed into the repair
+prompt as the diagnosed cause, because a repair round told "the counter is
+too narrow" converges in one step while the same round told only
+`FAIL: north green` can burn all of them rediscovering the same thing.
+
+The watchdog budget is derived from the testbench's own `` `timescale ``, so
+it cannot fire during a healthy run.
+
+### Measuring, not just waiting
+
+For a phase/timer check the prompts steer the testbench to a free-running
+monitor that timestamps state transitions and records each state's duration,
+rather than waiting a hard-coded number of cycles. Both matter: a
+transition-wait alone is immune to off-by-one but cannot tell a correct
+design from one whose phases are all 5x too long, and measuring each phase
+with a separate task silently loses the cycle in which the handover happened,
+making every phase after the first read one cycle short.
+
+## Measuring reliability
+
+A single green run says nothing about reliability. Before trusting a workflow
+on a new design, measure it:
+
+```bash
+uv run vlab rel "8-bit up/down counter with synchronous reset" --runs 5
+```
+
+Each attempt is an independent full `auto` run. The command reports the win
+rate, how many rounds each attempt needed, and the recorded reason for every
+failure — so a prompt's difficulty is a number instead of an impression, and
+a regression shows up as a falling rate rather than one unlucky run.
+
+Reliability is a property of the prompt, not just the tool. A design with
+timed phases, a handshake, or several interacting modes needs the generated
+testbench to agree with the generated DUT about exact cycle boundaries, and
+that is much harder than a combinational block. `rel` tells you which is
+which.
 
 ## Web dashboard
 
@@ -183,13 +284,55 @@ uv run vlab models --probe      # which models answer right now
 | `VLAB_LLM_FALLBACKS` | built-in pool | Comma-separated; empty disables rotation |
 | `VLAB_LLM_RETRIES` | `2` | Attempts **per model** before rotating |
 | `VLAB_LLM_MIN_INTERVAL` | `3.0` | Client-side seconds between calls |
+| `VLAB_LLM_RPS` | `10` | Hard ceiling on requests/sec; the interval grows to respect it |
+| `VLAB_LLM_429_COOLDOWN` | `2` | Consecutive 429s before abandoning a saturated model |
 | `VLAB_REASONING_EFFORT` | `low` | `off`/`exclude`/`low`/`medium`/`high`/`tokens` |
 | `VLAB_REASONING_MAX_TOKENS` | `512` | Only used with `VLAB_REASONING_EFFORT=tokens` |
+| `VLAB_GEN_MAX_TOKENS` | `16384` | Budget for one design+testbench reply |
+| `VLAB_GEN_ATTEMPTS` | `3` | Re-asks before a candidate is abandoned |
+| `VLAB_LLM_MAX_TOKENS_CAP` | `32768` | Ceiling for the automatic length-cutoff boost |
+| `VLAB_SYNTH_TIMEOUT` | `600` | Seconds before yosys is killed |
+| `VLAB_ESCALATION_ROUNDS` | `2` | Extra rounds after a round where every candidate failed (`0` disables) |
+| `VLAB_TIME_BUDGET_S` | `2400` | Wall-clock seconds before escalation stops widening the search (`0` disables) |
 
 > `VLAB_REASONING_EFFORT` sends **either** `effort` **or** `max_tokens`,
 > never both — OpenRouter returns HTTP 400 for a request carrying both.
 > Prefer `low`/`medium`/`high`; `exclude` asks the provider to strip
 > reasoning, which some thinking models answer with empty content.
+
+### Rate-limit guard rails
+
+OpenRouter answers anything above a model's request-rate ceiling with `429`
+rather than queueing, so a burst does not get absorbed — it gets rejected.
+Three defences:
+
+- **Rate ceiling.** `VLAB_LLM_RPS` (default `10`, under the 15 RPS free-tier
+  limit) sets a hard ceiling; the call interval grows to respect it. A garbage
+  value falls back to a safe default rather than disabling the guard.
+- **Per-model *and* global gates.** The throttle tracks the last call per
+  model as well as globally, because parallel candidates all call the same
+  primary model. With only a global timestamp, N candidates issued calls N
+  times too close together and a whole run stalled with no output.
+- **Rotate out of saturation.** `VLAB_LLM_429_COOLDOWN` (default `2`)
+  consecutive 429s abandons that model for the call instead of re-hitting the
+  same wall with the same cadence.
+
+Measure the real ceiling rather than guessing:
+
+```bash
+uv run vlab models --probe   # live availability of every model right now
+```
+
+### Truncated replies
+
+A reply cut off by the token limit arrives with `finish_reason: length` and
+is **partial JSON**, not an empty one. vlab treats that as truncation
+wherever it appears and retries with a larger budget rather than handing the
+fragment to the parser, and it recovers partial replies as a last resort.
+This matters more than it sounds: the DUT and its testbench travel as one
+JSON string, so every newline costs an escape and a non-trivial pair runs
+~7.6k tokens. Under a 4k budget that is not an occasional failure but a
+guaranteed one, and it surfaces as `Could not parse LLM output`.
 
 ### Model quirks vlab handles for you
 
@@ -200,10 +343,31 @@ warning rather than a failed candidate:
   undefined identifier, not a directive, and iverilog rejects the file with
   `design.v:1: syntax error`. Both `design.v` and the testbench are repaired
   automatically; the repair is recorded in `gen.json` warnings.
-- **Unparsable JSON or a wrong module name** — the reply is retried once
-  with the reason it was rejected, then the candidate is marked failed.
+- **`output wire` assigned inside `always`.** A bare `output` defaults to
+  `wire`, which is not a procedural l-value, so iverilog reports
+  `x is not a valid l-value` for every assignment. Fixed mechanically; the
+  repair is recorded in `gen.json` warnings.
+- **Task called with the wrong number of arguments.** Verilog does not check
+  arity at the call site, so this only appears at elaboration and kills the
+  candidate. The call is padded or trimmed to match the declaration.
+- **Unparsable JSON or a wrong module name** — the reply is retried with the
+  reason it was rejected, up to `VLAB_GEN_ATTEMPTS` times, before the
+  candidate is marked failed.
 - **Ports the model invented** are rejected against the spec, in both the
   design header and the testbench.
+
+Two defects are caught because they look like a normal failing check but
+cannot be repaired into a passing one, and both are reported in `gen.json`:
+
+- **A testbench that reads DUT internals.** `while (dut.state !== 3'd2)`
+  ties the check to one state encoding. The model is free to number its FSM
+  states any way it likes, so a testbench whose own `S_PED` constant happens
+  to differ waits forever. The testbench must observe output ports only.
+- **A counter too narrow for the spec's durations.** A generated
+  `reg [1:0] count; reg [1:0] NORTH_LIMIT;` cannot represent a 10-cycle
+  phase — it wraps at 3 — so the design is impossible from the start and the
+  testbench can never agree with it. Counters need `ceil(log2(max+1))` bits;
+  8 is cheap in area and removes the failure class.
 
 ## PDKs
 

@@ -86,7 +86,9 @@ def test_golden_bar_still_catches_a_weakened_repair(tmp_path, monkeypatch):
     proj = _mk_fix_session(tmp_path)
     sims = [
         {"status": "fail", "pass_count": 0, "fail_count": 1, "rc": 0},
-        {"status": "pass", "pass_count": 3, "fail_count": 0, "rc": 0},
+        # 6 checks: above the minimum-checks floor, so this test exercises
+        # the anti-weakening bar rather than the under-verified gate
+        {"status": "pass", "pass_count": 6, "fail_count": 0, "rc": 0},
     ]
 
     def fake_sim(*a, **k):

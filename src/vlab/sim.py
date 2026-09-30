@@ -75,6 +75,16 @@ def _parse_result(log: str, rc: int = 0) -> dict[str, Any]:
     }
     if rc == 0 and passes == 0 and fails == 0:
         out["note"] = "testbench made no assertions (0 PASS, 0 FAIL)"
+    # A killed simulator produced no verdict at all. Name the cause, because
+    # "fail, 0 pass, 0 fail" is indistinguishable from a missing testbench
+    # and sends the operator looking in the wrong place.
+    if "timeout" in log.lower() and passes == 0 and fails == 0:
+        out["note"] = (
+            "simulator timed out: the testbench never terminated "
+            "(a wait with no timeout never completed)"
+        )
+    if "watchdog" in log:
+        out["note"] = "watchdog fired: a wait in the testbench never completed"
     return out
 
 
